@@ -1,6 +1,7 @@
 # Fidelity Projected Least Squares
 
 Companion code for **Fast and Sure-ious Quantum Process Tomography**, A. Afham, S. Sen and M. Tomamichel.
+This code was written and is maintained by A. Afham.
 
 A quantum channel is estimated by running state tomography on copies of its Choi state and then
 repairing the estimate, which is a density matrix but not the Choi state of a channel. The paper
