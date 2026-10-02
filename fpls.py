@@ -455,6 +455,40 @@ def depolarizing_choi(nq, p, unitary=None):
     return (1 - p) * J + p * np.eye(d * d) / (d * d)
 
 
+def local_depolarizing_choi(nq, p):
+    """Independent depolarizing at p on each of the nq qubits. Full Choi rank.
+
+    Each qubit's Kraus set is {I, X, Y, Z} with weights (1 - 3p/4, p/4, p/4,
+    p/4), so the Choi eigenvalues are products of those: a tiered tail.
+    """
+    d = 2 ** nq
+    P = [np.eye(2), np.array([[0, 1], [1, 0]], complex),
+         np.array([[0, -1j], [1j, 0]]), np.diag([1.0, -1.0]).astype(complex)]
+    w1 = np.array([1 - 3 * p / 4, p / 4, p / 4, p / 4])
+    J = np.zeros((d * d, d * d), dtype=complex)
+    for sel in range(4 ** nq):
+        idx = [(sel >> (2 * q)) & 3 for q in range(nq)]
+        M, w = np.eye(1), 1.0
+        for q in range(nq):
+            M, w = np.kron(M, P[idx[q]]), w * w1[idx[q]]
+        v = _vec(M, d)
+        J += w * np.outer(v, v.conj())
+    return J
+
+
+def qft_bcsz_choi(nq, p, rng):
+    """(1 - p) x the QFT + p x a random channel of full Choi rank (BCSZ).
+
+    The random channel is the partial normalization of a normalised full-rank
+    Wishart matrix, so the mixture has full Choi rank with a spread tail.
+    """
+    d = 2 ** nq
+    G = (rng.standard_normal((d * d, d * d)) + 1j * rng.standard_normal((d * d, d * d))) / np.sqrt(2)
+    W = G @ G.conj().T
+    W /= np.trace(W).real
+    return (1 - p) * qft_choi(nq) + p * fidelity_projection(W, d)
+
+
 def random_channel_choi(dA, dB, r, rng):
     """BCSZ: a rank-r Wishart matrix normalised by its input marginal.
 

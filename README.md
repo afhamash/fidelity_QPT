@@ -50,14 +50,14 @@ Runtimes at the paper's parameters, measured on an Apple M4 (10 cores, 16 GB) un
 | item | paper parameters |
 |---|---|
 | Fig. 2, right | about 3 min |
-| Fig. 2, left, without the SDP | about 3.5 min |
+| Fig. 2, left, without the SDP | about 20 min; with the stored shot counts, a few minutes (estimates) |
 | Fig. 2, left, with the SDP | several hours (estimate) |
 | Fig. 3 | about 5 s |
 | Table 1 | about 2.5 min |
-| Fig. 4 | several hours (estimate) |
+| Fig. 4 | about 5 hours; with the stored shot counts, about an hour (estimates) |
 | Fig. 5 | about 3 min |
 | Fig. 6 | about 20 s |
-| Fig. 7 | about 10 s |
+| Fig. 7 | about 20 s |
 | Fig. 8 | about 1 min |
 <!-- /paper-runtimes -->
 

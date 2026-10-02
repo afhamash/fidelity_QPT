@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fpls import (DELTA, PAPER_SEED, amplitude_damping_choi, bernstein_radius,
+from fpls import (local_depolarizing_choi, qft_bcsz_choi, DELTA, PAPER_SEED, amplitude_damping_choi, bernstein_radius,
                   choi_rank, choi_to_kraus, depolarizing_choi, fidelity_projection,
                   fidelity_to_channels, infidelity, kraus_to_choi,
                   lmin_density_estimate, normalise_kraus, paper_rng, qft_choi,
@@ -154,6 +154,10 @@ def channel(name, nq, seed=PAPER_SEED):
     "werner_holevo"    Choi rank d_A(d_A - 1)/2 with a flat spectrum
     "depolarizing_pP"  global depolarizing at p = P/100, full Choi rank
     "qft_depol_pP"     the QFT followed by global depolarizing at p = P/100
+    "local_depol_pP"   independent depolarizing at p = P/100 on every qubit,
+                       full Choi rank with a tiered tail
+    "qft_bcsz_pP"      (1 - p) QFT + p (a random full-rank channel), p = P/100,
+                       full Choi rank with a spread tail
     "logrank"          a random channel of Choi rank log2(d_AB)
     """
     rng = paper_rng(seed, 1)
@@ -171,6 +175,10 @@ def channel(name, nq, seed=PAPER_SEED):
         return rho / np.trace(rho).real
     if name.startswith("depolarizing_p"):
         return depolarizing_choi(nq, int(name.split("_p")[1]) / 100)
+    if name.startswith("local_depol_p"):
+        return local_depolarizing_choi(nq, int(name.split("_p")[1]) / 100)
+    if name.startswith("qft_bcsz_p"):
+        return qft_bcsz_choi(nq, int(name.split("_p")[1]) / 100, paper_rng(seed, 4 ** nq, 17))
     if name.startswith("qft_depol_p"):
         return depolarizing_choi(nq, int(name.split("_p")[1]) / 100, unitary="qft")
     if name == "logrank":
@@ -454,37 +462,87 @@ def sweep_robustness(channels, nq=3, shots=None, trials=3, seed=PAPER_SEED,
 # ---------------------------------------------------------------------------
 # the cost sweeps: everything here is a wall-clock measurement on YOUR machine
 # ---------------------------------------------------------------------------
-def _calibrated_estimate(rho, target_dpu, seed, dA=None, tol=0.05, max_steps=30):
+def _dist_to_channels(rho, dA):
+    """Purified distance from rho to the Choi states of channels (Eq. 46)."""
+    F = fidelity_to_channels(rho, dA)
+    return float(np.sqrt(max(0.0, 1.0 - min(1.0, F) ** 2)))
+
+
+def _calibrated_estimate(rho, target_dpu, rng_seed, dA, N=None, lo=1e2, hi=1e8,
+                         iters=30, rel_tol=1e-2):
     """A density estimate sitting a fixed purified distance from the channel set.
 
     This is the paper's calibration. Comparing regularization cost across
     dimensions at a fixed shot count would be unfair, since the same N buys a
     better estimate at small d; instead the shot count is searched, by bisection
-    in log N, until the estimate is the prescribed distance from CPTP. The
-    distance costs one d_A x d_A eigendecomposition (Eq. 46), not an
-    optimization, which is what makes the search cheap. Returns the density
-    estimate, N, its distance, and the least eigenvalue of the least-squares
-    estimate, which sets HIP's default stopping tolerance.
+    in log N, until the density estimate (tau = -lambda_min) is within 1% of
+    the prescribed distance from the channel set. The distance costs one
+    d_A x d_A eigendecomposition (Eq. 46), not an optimization, which is what
+    makes the search cheap. Every evaluation redraws the measurement record
+    from the same seed `rng_seed`, so the distance is a deterministic function
+    of N and the search is reproducible; the paper stores the N it found for
+    every instance, and passing that N skips the search.
+
+    Returns the density estimate, N, its distance, and the least eigenvalue of
+    the least-squares estimate, which sets HIP's default stopping tolerance.
     """
-    d = rho.shape[0]
-    dA = int(round(np.sqrt(d))) if dA is None else int(dA)
-    lo, hi = 1e2, 1e12
-    best = None
-    for step in range(max_steps):
-        N = int(round(np.sqrt(lo * hi)))
-        rng = paper_rng(seed, 9, step)
-        rho_ls = simulate_ls_estimate(rho, N, rng)
+    def at(N):
+        rho_ls = simulate_ls_estimate(rho, int(N), paper_rng(*rng_seed))
         rho_hat = lmin_density_estimate(rho_ls)
-        dpu = float(np.sqrt(max(0.0, 1 - fidelity_to_channels(rho_hat, dA) ** 2)))
-        best = (rho_hat, N, dpu, float(np.linalg.eigvalsh(rho_ls)[0]))
-        if abs(dpu - target_dpu) <= tol * target_dpu:
-            break
-        lo, hi = (N, hi) if dpu > target_dpu else (lo, N)   # more shots -> closer
-    return best
+        return _dist_to_channels(rho_hat, dA), rho_hat, rho_ls
+
+    if N is None:
+        d_lo = at(lo)[0]                       # few shots: far from the set
+        while d_lo < target_dpu and lo > 8:
+            lo = max(8, lo // 10)
+            d_lo = at(lo)[0]
+        d_hi = at(hi)[0]                       # many shots: close to it
+        while d_hi > target_dpu and hi < 1e11:
+            hi *= 10
+            d_hi = at(hi)[0]
+        for _ in range(iters):
+            mid = int(np.sqrt(lo * hi))
+            d = at(mid)[0]
+            if d > target_dpu:
+                lo = mid                       # too noisy: need more shots
+            else:
+                hi = mid
+            if abs(d - target_dpu) < rel_tol * target_dpu:
+                break
+        N = int(np.sqrt(lo * hi))
+    d, rho_hat, rho_ls = at(N)
+    return rho_hat, int(N), d, float(np.linalg.eigvalsh(rho_ls)[0])
+
+
+def _calibration_channel(fam, dA, dB, seed):
+    """The random channels of Figs. 2 (left) and 4, with the paper's draws:
+    Choi rank 1 (a Haar isometry), log2(d_AB) or d_AB, at any (d_A, d_B)."""
+    d_AB = dA * dB
+    if fam == "rank1":
+        return random_channel_choi(dA, dB, 1, paper_rng(seed, d_AB, dA))
+    ranks = {"logrank": int(round(np.log2(d_AB))), "full": d_AB}
+    if fam not in ranks:
+        raise ValueError(f"unknown family {fam!r}; use 'rank1', 'logrank' or 'full'")
+    r = ranks[fam]
+    return random_channel_choi(dA, dB, r, paper_rng(seed, d_AB, dA, r))
+
+
+def _stored_N(cache, fam, target, d_AB):
+    """The paper's calibrated shot counts for one cell, or None."""
+    d = _cached(cache) or {}
+    if cache == "cost_ladder":
+        row = next((r for r in d.get("hip", []) if r["d_AB"] == d_AB), None)
+        return row.get("N") if row and d.get("target_purified_distance") == target else None
+    fam = {"rank1": "iso1"}.get(fam, fam)          # the data's name for the isometries
+    panel = next((p for p in d.get("panels", []) if p["family"] == fam), None)
+    lev = next((l for l in (panel or {}).get("levels", []) if l["target"] == target), None)
+    if lev and d_AB in lev["d_AB"] and "N" in lev:
+        return lev["N"][lev["d_AB"].index(d_AB)]
+    return None
 
 
 def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SEED,
-                      sdp=False, sdp_max=128, progress=True):
+                      sdp=False, sdp_max=128, stored_N=False, progress=True):
     """Fig. 2 (left): wall-clock of ONE TP regularization against dimension.
 
     Times, on this machine, the same calibrated density estimate regularized
@@ -498,6 +556,12 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
     `check_proj_TP()` verifies the two agree exactly where both are defined.
 
     HIP's time is the authors' own accounting of its computation (pls.py).
+
+    Each trial is its own instance: a Haar-random isometry (Choi rank 1) and a
+    measurement record drawn from the paper's seeds, calibrated by
+    `_calibrated_estimate`. stored_N=True takes the calibrated shot counts the
+    paper found from data/cost_ladder.json instead of searching for them again,
+    which gives the same instances and skips most of the run time.
 
     `dims` entries are either a Choi dimension d_AB, a power of two split as
     evenly as possible into (d_A, d_B), or an explicit (d_A, d_B) pair. So 64
@@ -514,29 +578,28 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
            "hip": [], "fpls": [], "sdp": []}
     for spec in dims:
         dA, dB, d_AB = _split_dims(spec)
-        # a Choi-rank-1 random channel, which is what the paper's ladder times and
-        # is defined for any (dA, dB); the qubit-structured channels of `channel`
-        # are square by construction
-        rho = random_channel_choi(dA, dB, 1, paper_rng(seed, 1, dA, dB))
-        rho_hat, N, dpu, ls_least = _calibrated_estimate(rho, target_dpu, seed, dA=dA)
+        rho = _calibration_channel("rank1", dA, dB, seed)
+        Ns = _stored_N("cost_ladder", "rank1", target_dpu, d_AB) if stored_N else None
+        insts = [_calibrated_estimate(rho, target_dpu, (seed, d_AB, dA, t), dA,
+                                      N=Ns[t] if Ns else None) for t in range(trials)]
         if progress:
-            _progress(f"d_A x d_B = {dA} x {dB}: calibrated at N = {N:.1e}, d_pu = {dpu:.3f}")
+            _progress(f"d_A x d_B = {dA} x {dB}: calibrated, median N = {np.median([x[1] for x in insts]):.1e}")
         # ours: the Kraus form of Theorem 5, which never forms a d_AB x d_AB matrix
         ts = []
-        for _ in range(trials):
+        for rho_hat, *_ in insts:
             t0 = time.perf_counter()
             normalise_kraus(choi_to_kraus(rho_hat, dA, dB))
             ts.append(time.perf_counter() - t0)
         out["fpls"].append({"d_AB": d_AB, "t": ts})
         if have_hip():
             ts, iters = [], []
-            for _ in range(trials):
+            for rho_hat, _, _, ls_least in insts:
                 _, info = hip_regularize(rho_hat, dA, dB, ls_least)
                 ts.append(info["t"])
                 iters.append(info["iters"])
-            out["hip"].append({"d_AB": d_AB, "t": ts, "iters": iters})
+            out["hip"].append({"d_AB": d_AB, "t": ts, "iters": iters, "N": [x[1] for x in insts]})
         if sdp and d_AB <= sdp_max:     # the SDP is out of reach beyond 2^7 (hours per instance)
-            ts = [_time_sdp(rho_hat, dA, dB) for _ in range(trials)]
+            ts = [_time_sdp(rho_hat, dA, dB) for rho_hat, *_ in insts]
             out["sdp"].append({"d_AB": d_AB, "t": ts})
     if progress:
         _progress()
@@ -569,14 +632,21 @@ def _time_sdp(rho_hat, dA, dB):
 
 
 def sweep_hip_iterations(dims=(4, 16, 64), targets=(0.05, 0.1, 0.2, 0.3),
-                         families=(("rank2", "Choi rank 2"),), trials=3,
-                         seed=PAPER_SEED, progress=True):
+                         families=(("rank1", "Choi rank 1 (isometry)"),), trials=3,
+                         seed=PAPER_SEED, stored_N=False, progress=True):
     """Fig. 4: HIP iterations against dimension, at fixed distance to the set.
 
     Each instance is calibrated to a purified distance from CPTP first, so
     dimension rather than estimate quality is the variable. The point of the
     figure is that it is not only the cost of an iteration that grows with
     dimension but the NUMBER of them. HIP runs at its authors' default settings.
+
+    The families are random channels of Choi rank 1 ("rank1"), log2(d_AB)
+    ("logrank") and d_AB ("full"), drawn at the instance's own (d_A, d_B), so
+    they exist at the rectangular dimensions too. Each trial is its own
+    instance, drawn and calibrated as in the paper. stored_N=True takes the
+    calibrated shot counts the paper found from data/hip_iterations.json
+    instead of searching for them again: the same instances, much faster.
     """
     if not have_hip():
         raise RuntimeError(f"this figure is HIP's iteration count; the PLS baseline is not importable, see {HIP_FILE}")
@@ -584,23 +654,18 @@ def sweep_hip_iterations(dims=(4, 16, 64), targets=(0.05, 0.1, 0.2, 0.3),
     for fam, label in families:
         levels = []
         for target in targets:
-            x, iters_all = [], []
+            x, iters_all, Ns_all = [], [], []
             for spec in dims:
                 dA, dB, d_AB = _split_dims(spec)
-                # The paper's three families are random channels of a prescribed Choi
-                # rank, drawn at the instance's own (dA, dB), so they exist at the
-                # rectangular dimensions too (d_AB = 8, 32, ...). Any other name goes
-                # through channel(), whose channels are qubit-structured and square.
-                ranks = {"rank1": 1, "logrank": max(1, int(np.log2(d_AB))), "full": d_AB}
-                if fam in ranks:
-                    rho = random_channel_choi(dA, dB, ranks[fam], paper_rng(seed, 1, dA, dB))
-                elif dA == dB:
-                    rho = channel(fam, int(np.log2(dA)), seed)
-                else:
-                    raise ValueError(f"the channel {fam!r} is defined for d_A = d_B only; use Choi "
-                                     f"dimensions 4, 16, 64, ... or one of {sorted(ranks)}")
-                rho_hat, N, _, ls_least = _calibrated_estimate(rho, target, seed, dA=dA)
-                its = [hip_regularize(rho_hat, dA, dB, ls_least)[1]["iters"] for _ in range(trials)]
+                rho = _calibration_channel(fam, dA, dB, seed)
+                Ns = _stored_N("hip_iterations", fam, target, d_AB) if stored_N else None
+                its, Nc = [], []
+                for t in range(trials):
+                    rho_hat, N, _, ls_least = _calibrated_estimate(
+                        rho, target, (seed, d_AB, dA, t), dA, N=Ns[t] if Ns else None)
+                    its.append(hip_regularize(rho_hat, dA, dB, ls_least)[1]["iters"])
+                    Nc.append(N)
+                Ns_all.append(Nc)
                 x.append(d_AB)
                 iters_all.append(its)
                 if progress:
@@ -619,7 +684,7 @@ def sweep_hip_iterations(dims=(4, 16, 64), targets=(0.05, 0.1, 0.2, 0.3),
                 fit = {"a": float(np.exp(loga)), "b": float(b),
                        "r2": float(1 - (resid ** 2).sum() / ss) if ss > 0 else 1.0}
             levels.append({"target": target, "fidelity": float(np.sqrt(1 - target ** 2)),
-                           "d_AB": x, "iters": iters_all, "median": med, "fit": fit})
+                           "d_AB": x, "iters": iters_all, "N": Ns_all, "median": med, "fit": fit})
         panels.append({"family": fam, "label": label, "levels": levels})
     if progress:
         _progress()
