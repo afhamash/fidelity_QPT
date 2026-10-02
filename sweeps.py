@@ -16,17 +16,16 @@ plus the sampling of N outcomes, and the least-squares stage materialises the
 a few seconds per trial. The defaults in the notebook are small on purpose; the
 paper's parameters are stated next to them and are what `data/*.json` holds.
 
-The PLS baseline. Its TP regularization is the hyperplane intersection
-projection of Surawy-Stepney, Kahn, Kueng and Guta. That implementation is
-third-party and is NOT vendored here, but it is BSD-3-Clause and public, so
-
-    git clone https://github.com/Hannoskaj/Hyperplane_Intersection_Projection.git
-
-next to this folder is enough: `have_hip()` then reports True and every sweep
-computes the PLS arm live alongside ours, from the same least-squares estimate.
-Without the clone, that arm is read from `data/*.json` and merged in when its
-dimension and shot grid match what you asked for, and otherwise dropped, so a
-figure never mixes a live curve with a cached one computed at another size.
+The PLS baseline. PLS-QPT of Surawy-Stepney, Kahn, Kueng and Guta is run with
+its authors' own code, shipped unmodified in hip/ and driven by `pls.py` at the
+settings of their simulation driver: the defaults where its cost is reported
+(Figs. 2 left and 4, the time column of Table 1), and a tight fixed tolerance
+where its accuracy and rank are reported (Figs. 2 right, 3, 5, 6, 7). Every
+sweep computes the PLS arm live, on the same least-squares estimate as ours,
+and `have_hip()` reports True. If hip/ cannot be imported, that arm is read
+from `data/*.json` and merged in when its dimension and shot grid match what
+you asked for, and otherwise dropped, so a figure never mixes a live curve with
+a cached one computed at another size.
 Everything this work contributes -- the thresholded density estimate and the
 fidelity projection -- is always computed live.
 """
@@ -50,116 +49,67 @@ DATA = Path(__file__).resolve().parent / "data"
 PAPER_SHOTS = [1e4, 1e5, 10 ** 5.5, 1e6, 10 ** 6.5, 1e7,
                10 ** 7.5, 1e8, 10 ** 8.5, 1e9, 10 ** 9.5, 1e10]
 
-__all__ = ["PAPER_SHOTS", "HIP_URL", "have_hip", "hip_regularize", "channel",
+__all__ = ["PAPER_SHOTS", "HIP_URL", "HIP_FILE", "have_hip", "pls_estimate", "hip_regularize", "channel",
            "sweep_headline", "sweep_accuracy", "sweep_spectra", "sweep_thresholds",
            "sweep_robustness", "sweep_cost_ladder", "sweep_hip_iterations",
            "sweep_table", "check_proj_TP"]
 
 
 # ---------------------------------------------------------------------------
-# the PLS baseline: the authors' own HIP, if it is on disk
+# the PLS baseline: the authors' code in hip/, run by pls.py
 # ---------------------------------------------------------------------------
-_HIP = None          # (HIP_switch, final_CPTP_by_mixing) once located
-_HIP_TRIED = False
+_PLS = None
+_PLS_TRIED = False
 
-HIP_URL = "https://github.com/Hannoskaj/Hyperplane_Intersection_Projection.git"
-_HIP_SUBDIR = Path("Hyperplane_Intersection_Projection") / "PLSQPT_article_code"
-
-
-def _find_hip():
-    """Locate and load kahn_projections from a checkout of the authors' repo.
-
-    Searched, in order: $HIP_REPO, this folder, its parents up to five levels
-    (so a clone next to the companion is found), and ~/Code. Returns None if
-    the repository is not on disk, which is not an error -- the sweeps then use
-    the cached PLS arm instead.
-    """
-    import importlib.util
-    import os
-    here = Path(__file__).resolve().parent
-    roots = ([Path(os.environ["HIP_REPO"])] if os.environ.get("HIP_REPO") else [])
-    roots += [p / _HIP_SUBDIR for p in [here, *list(here.parents)[:5], Path.home() / "Code"]]
-    root = next((r for r in roots if (r / "kahn_projections.py").exists()), None)
-    if root is None:
-        return None
-    import sys
-    if str(root) not in sys.path:
-        sys.path.append(str(root))          # appended: our modules keep priority
-    spec = importlib.util.spec_from_file_location("kahn_projections",
-                                                  root / "kahn_projections.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["kahn_projections"] = mod
-    spec.loader.exec_module(mod)
-    return getattr(mod, "HIP_switch"), getattr(mod, "final_CPTP_by_mixing")
+HIP_URL = "https://github.com/Hannoskaj/Hyperplane_Intersection_Projection"
+HIP_FILE = Path(__file__).resolve().parent / "hip"
 
 
 def have_hip():
-    """True if the authors' HIP implementation is importable (see HIP_URL)."""
-    global _HIP, _HIP_TRIED
-    if not _HIP_TRIED:
-        _HIP_TRIED = True
+    """True if the authors' implementation in hip/ is importable."""
+    global _PLS, _PLS_TRIED
+    if not _PLS_TRIED:
+        _PLS_TRIED = True
         try:
-            _HIP = _find_hip()
-        except Exception:                    # a broken checkout is not an error here
-            _HIP = None
-    return _HIP is not None
+            import pls
+            _PLS = pls
+        except Exception:                    # a broken copy is not an error here
+            _PLS = None
+    return _PLS is not None
 
 
-_AUTHORS_PROJ_TP = None
-
-
-def _proj_TP_rect(dA, dB):
-    """The authors' proj_TP, generalized to d_A != d_B.
-
-    Theirs reshapes the Choi matrix into four axes of equal length, so it holds
-    only for square dimensions. The projection onto the trace-preserving affine
-    subspace is the same correction in general: subtract the marginal's
-    deviation from I_A/d_A, spread uniformly over B.
-    """
-    IA, IB = np.eye(dA) / dA, np.eye(dB) / dB
-
-    def proj_TP(rho):
-        marg = np.trace(rho.reshape(dA, dB, dA, dB), axis1=1, axis2=3)
-        corr = np.einsum("de,fg->dfeg", IA - marg, IB)
-        return rho + corr.reshape(dA * dB, dA * dB)
-
-    return proj_TP
-
-
-def _install_proj_TP(dA, dB):
-    """Point the authors' module at the rectangular proj_TP when it is needed.
-
-    Their own routine is restored whenever d_A = d_B, so a square run is bit for
-    bit the published implementation and nothing of ours enters it.
-    """
-    global _AUTHORS_PROJ_TP
-    import sys
-    mod = sys.modules["kahn_projections"]
-    if _AUTHORS_PROJ_TP is None:
-        _AUTHORS_PROJ_TP = mod.proj_TP
-    mod.proj_TP = _AUTHORS_PROJ_TP if dA == dB else _proj_TP_rect(dA, dB)
+def _pls():
+    if not have_hip():
+        raise RuntimeError(f"the PLS baseline is not importable; see {HIP_FILE}")
+    return _PLS
 
 
 def check_proj_TP(rng=None, verbose=True):
-    """Our generalization must agree with theirs wherever theirs is defined."""
-    if not have_hip():
-        raise RuntimeError(f"needs the baseline on disk: git clone {HIP_URL}")
-    _install_proj_TP(2, 2)                     # captures the authors' routine
+    """Our projection onto the TP subspace must be the authors' one.
+
+    Theirs assumes d_A = d_B and takes the two systems in the opposite order to
+    ours, so on square dimensions ours must equal theirs conjugated by the swap
+    of the two systems; on rectangular ones its output must have marginal
+    exactly I_A/d_A.
+    """
+    pls = _pls()
+    theirs = pls._proj.proj_TP                 # their routine, never replaced
     rng = np.random.default_rng(0) if rng is None else rng
+    swap = lambda M, d: M.reshape(d, d, d, d).transpose(1, 0, 3, 2).reshape(d * d, d * d)
     worst_sq = worst_tp = 0.0
     for d in (2, 4, 8):
         for _ in range(10):
             H = rng.standard_normal((d * d, d * d)) + 1j * rng.standard_normal((d * d, d * d))
             H = (H + H.conj().T) / 2
             H /= np.trace(H).real
-            worst_sq = max(worst_sq, np.abs(_AUTHORS_PROJ_TP(H) - _proj_TP_rect(d, d)(H)).max())
+            worst_sq = max(worst_sq, np.abs(swap(theirs(swap(H, d)), d) - pls.proj_TP_for(d, d)(H)).max())
     for dA, dB in ((2, 4), (4, 2), (4, 8), (2, 8)):
         for _ in range(10):
             n = dA * dB
             H = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
             H = (H + H.conj().T) / 2
             H /= np.trace(H).real
-            marg = np.trace(_proj_TP_rect(dA, dB)(H).reshape(dA, dB, dA, dB), axis1=1, axis2=3)
+            marg = np.trace(pls.proj_TP_for(dA, dB)(H).reshape(dA, dB, dA, dB), axis1=1, axis2=3)
             worst_tp = max(worst_tp, np.abs(marg - np.eye(dA) / dA).max())
     if verbose:
         print(f"  vs the authors' proj_TP, square:  max|diff|    = {worst_sq:.2e}")
@@ -168,22 +118,26 @@ def check_proj_TP(rng=None, verbose=True):
     return worst_sq, worst_tp
 
 
-def hip_regularize(rho_cp1, dA, dB, tol=1e-8, max_iters=2000, final_mix=True):
-    """The PLS baseline's TP regularization, run exactly as its authors ship it.
-
-    Iterates HIP until the least eigenvalue is within tol/(dA dB) of zero, then
-    applies their final step, mixing with the maximally mixed state just enough
-    to lift that eigenvalue to zero, so the output is exactly a Choi state.
+def pls_estimate(rho_ls, dA, dB, tight=True):
+    """PLS-QPT end to end from a least-squares estimate: the authors' threshold,
+    HIP and final mixing. tight=True is the paper's setting for accuracy and
+    rank, tight=False the authors' default, used for cost. Returns (rho, info).
     """
-    if not have_hip():
-        raise RuntimeError(f"HIP is not on disk; clone it with\n  git clone {HIP_URL}")
-    hip, mixer = _HIP
-    _install_proj_TP(dA, dB)          # their own routine whenever dA == dB
-    est, iters = hip(rho_cp1.copy(), free_trace=True,
-                     least_ev_x_dim2_tol=tol, maxiter=max_iters)
-    if final_mix and np.linalg.eigvalsh(est).min() < 0:
-        est = mixer(est)
-    return est, iters
+    pls = _pls()
+    return pls.pls_tight(rho_ls, dA, dB) if tight else pls.pls_default(rho_ls, dA, dB)
+
+
+def hip_regularize(rho_hat, dA, dB, ls_least_ev=0.0, tight=False):
+    """HIP and the final mixing on a given density estimate. Returns (rho, info).
+
+    tight=False: the authors' default, with the stopping tolerance set from
+    `ls_least_ev`, the least eigenvalue of the least-squares estimate (the
+    paper's cost measurements); tight=True: the tight fixed tolerance.
+    """
+    pls = _pls()
+    if tight:
+        return pls.hip_tight(rho_hat, dA, dB)
+    return pls.hip_default(rho_hat, ls_least_ev, dA, dB)
 
 
 # ---------------------------------------------------------------------------
@@ -205,10 +159,16 @@ def channel(name, nq, seed=PAPER_SEED):
     rng = paper_rng(seed, 1)
     if name == "rank2":
         return rank_two_channel(nq, rng)
+    # the draws and the trace normalization below are the paper's own, so that
+    # the instances, and the measurement records sampled from them, are bit for
+    # bit those of data/*.json
     if name.startswith("amp_damping_r"):
-        return amplitude_damping_choi(nq, int(name.split("_r")[1]), rng)
+        k = int(name.split("_r")[1])
+        rho = amplitude_damping_choi(nq, k, paper_rng(seed, 4 ** nq, 5, 2 ** k, 0))
+        return rho / np.trace(rho).real
     if name == "werner_holevo":
-        return werner_holevo_choi(nq)
+        rho = werner_holevo_choi(nq)
+        return rho / np.trace(rho).real
     if name.startswith("depolarizing_p"):
         return depolarizing_choi(nq, int(name.split("_p")[1]) / 100)
     if name.startswith("qft_depol_p"):
@@ -242,6 +202,20 @@ def _split_dims(spec):
 # ---------------------------------------------------------------------------
 # one trial of one rule
 # ---------------------------------------------------------------------------
+_PROGRESS_WIDTH = 78
+
+
+def _progress(msg=""):
+    """Overwrite the current progress line with `msg`.
+
+    The line is padded with spaces to a fixed width, so a shorter message fully
+    replaces a longer one instead of leaving its tail behind. Called with no
+    argument it clears the line.
+    """
+    print("\r" + f"  {msg}"[:_PROGRESS_WIDTH].ljust(_PROGRESS_WIDTH) + ("" if msg else "\r"),
+          end="", flush=True)
+
+
 def _estimate(rho_ls, rho_true, dA, rule, beta):
     """Density estimate under one threshold rule, then the fidelity projection.
 
@@ -257,18 +231,23 @@ def _estimate(rho_ls, rho_true, dA, rule, beta):
     elif rule == "bernstein_half":
         rho_hat = threshold_density_estimate(rho_ls, tau=0.5 * beta)
     elif rule == "pls_hip":
-        # the published baseline end to end: its own threshold, then its own
-        # TP regularization, so nothing of ours enters this curve
-        rho_hat = lmin_density_estimate(rho_ls)
-        est, _ = hip_regularize(rho_hat, dA, rho_ls.shape[0] // dA)
-        return rho_hat, est
+        # the published baseline end to end, at the tight tolerance: its own
+        # threshold, then its own TP regularization, so nothing of ours enters
+        est, _ = pls_estimate(rho_ls, dA, rho_ls.shape[0] // dA)
+        return None, est
     else:
         raise ValueError(f"unknown rule {rule!r}")
     est = fidelity_projection(rho_hat, dA)
     return rho_hat, est
 
 
-def _sweep(rho, shots, trials, rules, seed, fields=("rank", "inf"), progress=True):
+def _shot_key(N):
+    """The shot count's index in the paper's seeds, int(10 log10 N) of the
+    integer shot count, so that 10^5.5 maps to 54, as it did there."""
+    return int(np.log10(int(N)) * 10)
+
+
+def _sweep(rho, shots, trials, rules, seed, fields=("rank", "inf"), progress=True, stream=4):
     """{rule: {field: [[trial, ...] per shot count]}} over a shot grid.
 
     One least-squares estimate per (shot count, trial) is shared by every rule,
@@ -280,7 +259,10 @@ def _sweep(rho, shots, trials, rules, seed, fields=("rank", "inf"), progress=Tru
     out = {r: {f: [[] for _ in shots] for f in fields} for r in rules}
     for i, N in enumerate(shots):
         for t in range(trials):
-            rng = paper_rng(seed, 4, int(round(np.log10(N) * 10)), t)
+            # stream 4 is the one the paper's accuracy sweeps (Figs. 5-7) were drawn
+            # from; Fig. 2 (right) was drawn from stream 1 (sweep_headline) and
+            # Fig. 8 from stream 2 (sweep_thresholds)
+            rng = paper_rng(seed, stream, _shot_key(N), t)
             rho_ls = simulate_ls_estimate(rho, int(N), rng)
             beta = bernstein_radius(d, int(N), DELTA)
             for rule in rules:
@@ -291,9 +273,9 @@ def _sweep(rho, shots, trials, rules, seed, fields=("rank", "inf"), progress=Tru
                 for f in fields:
                     out[rule][f][i].append(vals[f])
         if progress:
-            print(f"\r  N = 1e{np.log10(N):.1f}  ({i + 1}/{len(shots)})", end="", flush=True)
+            _progress(f"N = 1e{np.log10(N):g}  ({i + 1} of {len(shots)} shot counts)")
     if progress:
-        print("\r" + " " * 40 + "\r", end="")
+        _progress()
     return out
 
 
@@ -307,8 +289,8 @@ def _cached(name):
 def _merge_pls(live, cache_name, shots, d_AB, path=("pls_hip",)):
     """Add the cached PLS arm when it is the same sweep, else leave it out.
 
-    The HIP regularization is not vendored (see the module docstring), so this
-    curve can only come from the cache. It is merged only if the cached sweep
+    Used only when hip/ cannot be imported (see the module docstring), in
+    which case this curve can only come from the cache. It is merged only if the cached sweep
     has the same Choi dimension and shot grid, so a figure never mixes a live
     FPLS curve with a PLS curve computed at another size.
     """
@@ -332,7 +314,7 @@ def sweep_headline(nq=2, shots=None, trials=3, seed=PAPER_SEED, progress=True):
     rho = channel("rank2", nq, seed)
     d_AB = rho.shape[0]
     rules = ("bernstein", "pls_hip") if have_hip() else ("bernstein",)
-    res = _sweep(rho, shots, trials, rules, seed, progress=progress)
+    res = _sweep(rho, shots, trials, rules, seed, progress=progress, stream=1)
     out = {"d_AB": d_AB, "true_rank": choi_rank(rho), "delta": DELTA,
            "shots": shots, "fpls": res["bernstein"]}
     pls = res.get("pls_hip") or _merge_pls(None, "headline", shots, d_AB)
@@ -362,15 +344,17 @@ def sweep_thresholds(channels=(("rank2", None), ("amp_damping_r2", None)),
     """Fig. 8: the four threshold rules, all regularized the same way.
 
     This figure needs no cached data at all: every curve in it is an instance of
-    the thresholded estimator followed by the fidelity projection.
+    the thresholded estimator followed by the fidelity projection. A channel is
+    (name, label) or (name, label, nq); the paper's two panels sit at different
+    sizes, nq = 3 and nq = 4.
     """
     shots = list(PAPER_SHOTS if shots is None else shots)
     rules = ("tau0", "lmin", "bernstein", "bernstein_half")
     panels = []
-    for name, label in channels:
-        rho = channel(name, nq, seed)
+    for name, label, *own in channels:      # an optional third entry overrides nq for that channel
+        rho = channel(name, own[0] if own else nq, seed)
         lam = np.linalg.eigvalsh(rho)
-        res = _sweep(rho, shots, trials, rules, seed, progress=progress)
+        res = _sweep(rho, shots, trials, rules, seed, progress=progress, stream=2)
         panels.append({"label": label or f"{name}, $d_{{AB}} = {rho.shape[0]}$",
                        "d_AB": rho.shape[0], "true_rank": choi_rank(rho),
                        "lambda_r": float(lam[lam > 1e-10].min()),
@@ -383,16 +367,19 @@ def sweep_spectra(channels=(("rank2", "rank-2 channel"),
                   nq=2, N=1e6, seed=PAPER_SEED):
     """Fig. 3: the density estimate and its fidelity projection at one N.
 
-    The HIP column is merged from the cache when the dimension and N match;
-    otherwise the figure shows the two columns that can be computed here.
+    Both regularizations, the fidelity projection and HIP (at the tight
+    tolerance), are applied to the same density estimate at tau = beta_N/2.
+    The figure draws its own instance of the rank-2 family and its own
+    measurement record, as the paper's Fig. 3 does, so nq=4, N=1e8 reproduces
+    data/spectra.json.
     """
     cache = _cached("spectra")
     panels = []
     for name, label in channels:
-        rho = channel(name, nq, seed)
+        rho = rank_two_channel(nq, paper_rng(seed, 3)) if name == "rank2" else channel(name, nq, seed)
         d_AB = rho.shape[0]
         dA = int(round(np.sqrt(d_AB)))
-        rng = paper_rng(seed, 4, int(round(np.log10(N) * 10)), 0)
+        rng = paper_rng(seed, 3, 1)
         rho_ls = simulate_ls_estimate(rho, int(N), rng)
         beta = bernstein_radius(d_AB, int(N), DELTA)
         rho_hat, est = _estimate(rho_ls, rho, dA, "bernstein_half", beta)
@@ -403,7 +390,8 @@ def sweep_spectra(channels=(("rank2", "rank-2 channel"),
                  "fpls": {"spectrum": sorted(np.linalg.eigvalsh(est), reverse=True),
                           "rank": choi_rank(est), "infidelity": infidelity(rho, est)}}
         if have_hip():
-            _, hip_est = _estimate(rho_ls, rho, dA, "pls_hip", beta)
+            # as in the paper's Fig. 3: HIP regularizes the SAME density estimate
+            hip_est, _ = hip_regularize(rho_hat, dA, dA, tight=True)
             panel["pls_hip"] = {"spectrum": sorted(np.linalg.eigvalsh(hip_est), reverse=True),
                                 "rank": choi_rank(hip_est),
                                 "infidelity": infidelity(rho, hip_est)}
@@ -417,23 +405,48 @@ def sweep_spectra(channels=(("rank2", "rank-2 channel"),
 
 
 def sweep_robustness(channels, nq=3, shots=None, trials=3, seed=PAPER_SEED,
-                     rule="bernstein_half", progress=True):
-    """Figs. 6 and 7: one column per channel, rank and infidelity.
+                     rule="bernstein_half", spectra_at=(1e6, None), progress=True):
+    """Figs. 6 and 7: one column per channel; spectra, rank and infidelity.
 
     `channels` is a sequence of (name, label) pairs; see `channel.__doc__`.
-    The spectra rows of the paper's Figs. 6-7 need the HIP estimate and so are
-    not produced here, and the figure falls back to its two lower rows.
+    `spectra_at` lists the shot counts whose estimated Choi spectra fill the
+    top rows of the figure; None stands for the largest shot count of the grid
+    (the paper uses 1e6 and 1e10). Each spectrum is that of trial 0 at that
+    shot count, the same least-squares estimate the rank and infidelity rows
+    use. Pass spectra_at=() to skip the spectra rows.
     """
     shots = list(PAPER_SHOTS if shots is None else shots)
+    at = []
+    for N in spectra_at:
+        N = shots[-1] if N is None else N
+        if N in shots and N not in at:
+            at.append(N)
     cols = []
     for name, label in channels:
         rho = channel(name, nq, seed)
+        d = rho.shape[0]
+        dA = int(round(np.sqrt(d)))
         rules = (rule, "pls_hip") if have_hip() else (rule,)
         res = _sweep(rho, shots, trials, rules, seed, progress=progress)
-        col = {"label": label, "d_AB": rho.shape[0], "true_rank": choi_rank(rho),
+        col = {"label": label, "d_AB": d, "true_rank": choi_rank(rho),
                "shots": shots, "fpls": res[rule]}
         if "pls_hip" in res:
             col["pls_hip"] = res["pls_hip"]
+        if at:
+            desc = lambda m: np.linalg.eigvalsh(m)[::-1].tolist()
+            col["true_spectrum"] = desc(rho)
+            col["spectra"] = {}
+            for N in at:
+                # the trial-0 stream of _sweep, so this is one of its estimates
+                rng = paper_rng(seed, 4, _shot_key(N), 0)
+                rho_ls = simulate_ls_estimate(rho, int(N), rng)
+                beta = bernstein_radius(d, int(N), DELTA)
+                entry = {}
+                for key, r in (("fpls", rule), ("pls_hip", "pls_hip")):
+                    if r in rules:
+                        _, est = _estimate(rho_ls, rho, dA, r, beta)
+                        entry[key] = {"spectrum": desc(est), "rank": choi_rank(est)}
+                col["spectra"][f"N{N:.0e}"] = entry
         cols.append(col)
     return {"columns": cols}
 
@@ -449,7 +462,9 @@ def _calibrated_estimate(rho, target_dpu, seed, dA=None, tol=0.05, max_steps=30)
     better estimate at small d; instead the shot count is searched, by bisection
     in log N, until the estimate is the prescribed distance from CPTP. The
     distance costs one d_A x d_A eigendecomposition (Eq. 46), not an
-    optimization, which is what makes the search cheap.
+    optimization, which is what makes the search cheap. Returns the density
+    estimate, N, its distance, and the least eigenvalue of the least-squares
+    estimate, which sets HIP's default stopping tolerance.
     """
     d = rho.shape[0]
     dA = int(round(np.sqrt(d))) if dA is None else int(dA)
@@ -458,9 +473,10 @@ def _calibrated_estimate(rho, target_dpu, seed, dA=None, tol=0.05, max_steps=30)
     for step in range(max_steps):
         N = int(round(np.sqrt(lo * hi)))
         rng = paper_rng(seed, 9, step)
-        rho_hat = lmin_density_estimate(simulate_ls_estimate(rho, N, rng))
+        rho_ls = simulate_ls_estimate(rho, N, rng)
+        rho_hat = lmin_density_estimate(rho_ls)
         dpu = float(np.sqrt(max(0.0, 1 - fidelity_to_channels(rho_hat, dA) ** 2)))
-        best = (rho_hat, N, dpu)
+        best = (rho_hat, N, dpu, float(np.linalg.eigvalsh(rho_ls)[0]))
         if abs(dpu - target_dpu) <= tol * target_dpu:
             break
         lo, hi = (N, hi) if dpu > target_dpu else (lo, N)   # more shots -> closer
@@ -468,19 +484,20 @@ def _calibrated_estimate(rho, target_dpu, seed, dA=None, tol=0.05, max_steps=30)
 
 
 def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SEED,
-                      sdp=False, hip_tol=1e-6, progress=True):
+                      sdp=False, sdp_max=128, progress=True):
     """Fig. 2 (left): wall-clock of ONE TP regularization against dimension.
 
     Times, on this machine, the same calibrated density estimate regularized
     two or three ways: the closed-form fidelity projection in Kraus form, HIP at
-    its authors' default tolerance, and, with sdp=True, the diamond-norm
+    its authors' default settings, and, with sdp=True, the diamond-norm
     projection semidefinite program (needs cvxpy, and is the reason the paper
     stops at d_AB = 2^7 for that curve).
 
     Rectangular dimensions. The authors' proj_TP reshapes into four axes of
-    equal length and so assumes d_A = d_B; `_proj_TP_rect` generalizes it and is
-    installed only when d_A != d_B, their own routine being restored otherwise.
+    equal length and so assumes d_A = d_B; `pls.proj_TP_for` generalizes it, and
     `check_proj_TP()` verifies the two agree exactly where both are defined.
+
+    HIP's time is the authors' own accounting of its computation (pls.py).
 
     `dims` entries are either a Choi dimension d_AB, a power of two split as
     evenly as possible into (d_A, d_B), or an explicit (d_A, d_B) pair. So 64
@@ -492,7 +509,7 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
     reproduces.
     """
     import time
-    out = {"target_purified_distance": target_dpu, "hip_tolerance": hip_tol,
+    out = {"target_purified_distance": target_dpu, "hip_settings": "authors' default",
            "note": "one TP regularization of one calibrated density estimate, timed live",
            "hip": [], "fpls": [], "sdp": []}
     for spec in dims:
@@ -501,11 +518,10 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
         # is defined for any (dA, dB); the qubit-structured channels of `channel`
         # are square by construction
         rho = random_channel_choi(dA, dB, 1, paper_rng(seed, 1, dA, dB))
-        rho_hat, N, dpu = _calibrated_estimate(rho, target_dpu, seed, dA=dA)
+        rho_hat, N, dpu, ls_least = _calibrated_estimate(rho, target_dpu, seed, dA=dA)
         if progress:
-            print(f"\r  d_A x d_B = {dA} x {dB}: calibrated at N = {N:.1e},"
-                  f" d_pu = {dpu:.3f}", end="", flush=True)
-        # ours: the Kraus form of Theorem 6, which never forms a d_AB x d_AB matrix
+            _progress(f"d_A x d_B = {dA} x {dB}: calibrated at N = {N:.1e}, d_pu = {dpu:.3f}")
+        # ours: the Kraus form of Theorem 5, which never forms a d_AB x d_AB matrix
         ts = []
         for _ in range(trials):
             t0 = time.perf_counter()
@@ -515,16 +531,15 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
         if have_hip():
             ts, iters = [], []
             for _ in range(trials):
-                t0 = time.perf_counter()
-                _, it = hip_regularize(rho_hat, dA, dB, tol=hip_tol)
-                ts.append(time.perf_counter() - t0)
-                iters.append(it)
+                _, info = hip_regularize(rho_hat, dA, dB, ls_least)
+                ts.append(info["t"])
+                iters.append(info["iters"])
             out["hip"].append({"d_AB": d_AB, "t": ts, "iters": iters})
-        if sdp:
+        if sdp and d_AB <= sdp_max:     # the SDP is out of reach beyond 2^7 (hours per instance)
             ts = [_time_sdp(rho_hat, dA, dB) for _ in range(trials)]
             out["sdp"].append({"d_AB": d_AB, "t": ts})
     if progress:
-        print("\r" + " " * 60 + "\r", end="")
+        _progress()
     for k in ("hip", "sdp"):                      # an absent arm is dropped, not empty
         if not out[k]:
             out.pop(k)
@@ -555,17 +570,16 @@ def _time_sdp(rho_hat, dA, dB):
 
 def sweep_hip_iterations(dims=(4, 16, 64), targets=(0.05, 0.1, 0.2, 0.3),
                          families=(("rank2", "Choi rank 2"),), trials=3,
-                         seed=PAPER_SEED, hip_tol=1e-6, progress=True):
+                         seed=PAPER_SEED, progress=True):
     """Fig. 4: HIP iterations against dimension, at fixed distance to the set.
 
     Each instance is calibrated to a purified distance from CPTP first, so
     dimension rather than estimate quality is the variable. The point of the
     figure is that it is not only the cost of an iteration that grows with
-    dimension but the NUMBER of them.
+    dimension but the NUMBER of them. HIP runs at its authors' default settings.
     """
     if not have_hip():
-        raise RuntimeError(f"this figure is HIP's iteration count; clone it with"
-                           f"\n  git clone {HIP_URL}")
+        raise RuntimeError(f"this figure is HIP's iteration count; the PLS baseline is not importable, see {HIP_FILE}")
     panels = []
     for fam, label in families:
         levels = []
@@ -573,14 +587,24 @@ def sweep_hip_iterations(dims=(4, 16, 64), targets=(0.05, 0.1, 0.2, 0.3),
             x, iters_all = [], []
             for spec in dims:
                 dA, dB, d_AB = _split_dims(spec)
-                rho = (random_channel_choi(dA, dB, 1, paper_rng(seed, 1, dA, dB))
-                       if fam == "rank1" else channel(fam, int(np.log2(dA)), seed))
-                rho_hat, N, _ = _calibrated_estimate(rho, target, seed, dA=dA)
-                its = [hip_regularize(rho_hat, dA, dB, tol=hip_tol)[1] for _ in range(trials)]
+                # The paper's three families are random channels of a prescribed Choi
+                # rank, drawn at the instance's own (dA, dB), so they exist at the
+                # rectangular dimensions too (d_AB = 8, 32, ...). Any other name goes
+                # through channel(), whose channels are qubit-structured and square.
+                ranks = {"rank1": 1, "logrank": max(1, int(np.log2(d_AB))), "full": d_AB}
+                if fam in ranks:
+                    rho = random_channel_choi(dA, dB, ranks[fam], paper_rng(seed, 1, dA, dB))
+                elif dA == dB:
+                    rho = channel(fam, int(np.log2(dA)), seed)
+                else:
+                    raise ValueError(f"the channel {fam!r} is defined for d_A = d_B only; use Choi "
+                                     f"dimensions 4, 16, 64, ... or one of {sorted(ranks)}")
+                rho_hat, N, _, ls_least = _calibrated_estimate(rho, target, seed, dA=dA)
+                its = [hip_regularize(rho_hat, dA, dB, ls_least)[1]["iters"] for _ in range(trials)]
                 x.append(d_AB)
                 iters_all.append(its)
                 if progress:
-                    print(f"\r  {fam} d_pu={target}: {dA} x {dB}", end="", flush=True)
+                    _progress(f"{fam}, d_pu = {target}: d_A x d_B = {dA} x {dB}")
             med = [float(np.median(i)) for i in iters_all]
             # a small instance already inside the tolerance needs zero iterations,
             # which has no logarithm; such points are excluded from the power law
@@ -598,29 +622,39 @@ def sweep_hip_iterations(dims=(4, 16, 64), targets=(0.05, 0.1, 0.2, 0.3),
                            "d_AB": x, "iters": iters_all, "median": med, "fit": fit})
         panels.append({"family": fam, "label": label, "levels": levels})
     if progress:
-        print("\r" + " " * 60 + "\r", end="")
+        _progress()
     return {"panels": panels}
 
 
-def sweep_table(dims=(16, 64), N=1e6, trials=3, seed=PAPER_SEED, hip_tol=1e-6,
-                progress=True):
+def sweep_table(dims=(16, 64), N=1e6, trials=3, families=("rank2", "logrank"),
+                seed=PAPER_SEED, progress=True):
     """Table 1: fidelity, TP-regularization time and storage, head to head.
 
     Storage is counted the way the table does: a dense d_AB x d_AB matrix for
     the PLS estimate against r Kraus operators of size d_B x d_A for ours, in
-    double precision, which is where the ratio comes from.
+    double precision, which is where the ratio comes from. PLS-QPT runs end to
+    end at its authors' default settings, and its time is their own accounting
+    of HIP and the final mixing (pls.py). The paper's table is dims=(64, 1024),
+    N=1e8, trials=3, whose instances and measurement records this reproduces.
     """
     import time
     rows = []
-    for spec in dims:
+    for fam, spec in ((f, s) for f in families for s in dims):
         dA, dB, d_AB = _split_dims(spec)
         if dA != dB:
             raise ValueError("the table's channels are qubit-structured, so it needs "
                              "d_A = d_B; pass Choi dimensions 4, 16, 64, ...")
-        rho = channel("rank2", int(np.log2(dA)), seed)
+        nq = int(np.log2(dA))
+        if fam == "rank2":
+            rho = channel("rank2", nq, seed)
+        elif fam == "logrank":                 # the table's own draw of the log-rank channel
+            r = int(round(np.log2(d_AB)))
+            rho = random_channel_choi(dA, dB, r, paper_rng(seed, d_AB, dA, r))
+        else:
+            raise ValueError(f"the table's families are 'rank2' and 'logrank', not {fam!r}")
         fp, hp = [], []
         for t in range(trials):
-            rng = paper_rng(seed, 11, int(round(np.log10(N) * 10)), t)
+            rng = paper_rng(seed, 9, nq, t)
             rho_ls = simulate_ls_estimate(rho, int(N), rng)
             beta = bernstein_radius(d_AB, int(N), DELTA)
             rho_hat = threshold_density_estimate(rho_ls, tau=0.5 * beta)
@@ -631,20 +665,18 @@ def sweep_table(dims=(16, 64), N=1e6, trials=3, seed=PAPER_SEED, hip_tol=1e-6,
             fp.append({"F": 1 - infidelity(rho, est), "t": t_f, "rank": choi_rank(est),
                        "bytes": 16 * len(Ks) * dA * dB})
             if have_hip():
-                rho_l = lmin_density_estimate(rho_ls)
-                t0 = time.perf_counter()
-                est_h, iters = hip_regularize(rho_l, dA, dB, tol=hip_tol)
-                t_h = time.perf_counter() - t0
-                hp.append({"F": 1 - infidelity(rho, est_h), "t": t_h,
+                est_h, info = pls_estimate(rho_ls, dA, dB, tight=False)
+                est_h = _pls().psd_guard(est_h)
+                hp.append({"F": 1 - infidelity(rho, est_h), "t": info["t"],
                            "rank": choi_rank(est_h), "bytes": 16 * d_AB * d_AB,
-                           "iters": iters})
-        row = {"family": "rank2", "nq": int(np.log2(dA)), "d_AB": d_AB,
+                           "iters": info["iters"]})
+        row = {"family": fam, "nq": nq, "d_AB": d_AB,
                "true_rank": choi_rank(rho), "fpls": fp}
         if hp:
             row["hip"] = hp
         rows.append(row)
         if progress:
-            print(f"\r  d_AB = {d_AB} done", end="", flush=True)
+            _progress(f"{fam}, d_AB = {d_AB} done")
     if progress:
-        print("\r" + " " * 40 + "\r", end="")
-    return {"N": N, "trials": trials, "hip_tolerance": hip_tol, "rows": rows}
+        _progress()
+    return {"N": N, "trials": trials, "hip_settings": "authors' default", "rows": rows}

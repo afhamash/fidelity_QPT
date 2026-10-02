@@ -15,13 +15,15 @@ from pathlib import Path
 
 import numpy as np
 from matplotlib.colors import to_rgb, to_rgba
-from matplotlib.ticker import LogFormatterSciNotation, LogLocator
+from matplotlib.patches import Patch
+from matplotlib.ticker import FixedLocator, FuncFormatter, LogFormatterSciNotation, LogLocator
 
 from fpls import OURS, HIP, SDP, GREY, use_style, save_figure
 from sweeps import HIP_URL
 
 plt = use_style()
 DATA = Path(__file__).resolve().parent / "data"
+BAR, BAR_ALPHA = "#44AA99", 0.5     # the true-spectrum fill of Figs. 6-7 (teal), as in the paper
 
 __all__ = ["fig_headline", "fig_cost_ladder", "fig_hip_iterations",
            "fig_threshold_strategies", "fig_spectra", "fig_accuracy",
@@ -72,7 +74,7 @@ def _band(ax, x, rows, colour, marker, label, alpha=0.18, centre="geomean"):
     """Opaque centre line over translucent per-trial trajectories.
 
     centre="mode" for ranks (integer valued), "geomean" for accuracies (see
-    _geomean), "median" for wall-clock timings.
+    _geomean), "median" for timings.
     """
     for t in range(rows.shape[1]):
         ax.plot(x, rows[:, t], marker[0], color=colour, ls="none", ms=3, alpha=alpha)
@@ -130,7 +132,7 @@ def _fmt(N):
 def fig_headline(data=None, ladder=None, outdir=None, quiet=False):
     """Fig. 2: what the closed form buys, in one figure.
 
-    Left, full height: wall-clock of ONE TP regularization against Choi
+    Left, full height: time of ONE TP regularization against Choi
     dimension, for the same calibrated density estimate regularized three ways.
     Right, stacked and sharing the shot axis: recovered Choi rank over the
     infidelity of the same estimates. Both right-hand pipelines post-process the
@@ -167,7 +169,7 @@ def fig_headline(data=None, ladder=None, outdir=None, quiet=False):
     axA.set(xscale="log", yscale="log")
     axA.set_xscale("log", base=2)
     axA.set_xlabel(r"Choi dimension $d_{\mathsf{AB}}$")
-    axA.set_ylabel("Post-processing wall-clock (s)")
+    axA.set_ylabel("Post-processing time (s)")
     axA.set_title("TP regularization cost")
     axA.set_ylim(top=axA.get_ylim()[1] * 12)   # headroom so the legend clears the SDP points
     axA.legend(loc="upper left")
@@ -179,8 +181,9 @@ def fig_headline(data=None, ladder=None, outdir=None, quiet=False):
     _band(axR, shots, rank_h, HIP, "s--", "PLS", centre="mode")
     _band(axR, shots, rank_f, OURS, "o-", "FPLS (this work)", centre="mode")
     axR.axhline(r_true, color="k", ls=":", lw=1.4)
-    axR.text(shots[0], r_true * 1.2, f"True Choi rank = {r_true}", color="k", fontsize=7.5,
-             ha="left", va="bottom")
+    # x in axes fraction, y in data: the label hugs the left spine, clear of the onset line
+    axR.text(0.012, r_true, f"True Choi rank = {r_true}", color="k", fontsize=7.5,
+             transform=axR.get_yaxis_transform(), ha="left", va="bottom")
     axR.set_yscale("log", base=2)
     axR.set_ylabel("Choi rank")
     axR.set_title("Choi ranks of estimates")
@@ -214,13 +217,13 @@ def fig_headline(data=None, ladder=None, outdir=None, quiet=False):
     big = max(med["fpls"]) if med["fpls"] else None
     if big and big in med.get("hip", {}):
         _say(quiet, f"at d_AB = {big:<5d}  HIP {med['hip'][big]:8.3f} s   FPLS"
-                    f" {med['fpls'][big] * 1e3:8.3f} ms   (paper, at 2^10: 52 s against 0.28 ms)")
+                    f" {med['fpls'][big] * 1e3:8.3f} ms   (paper, at 2^10: 11.5 s against 0.28 ms)")
     if med["sdp"]:
         at = "   ".join(f"at {k}: {v:.2f} s" for k, v in sorted(med["sdp"].items()))
         _say(quiet, f"SDP              {at}      (paper: 19 s at 2^6, 86 s at 2^7)")
     _say(quiet, f"onset of exact rank recovery      N = {onset:.0e}        (paper: 1e6)")
     _say(quiet, f"PLS-QPT rank over all N, trials   {int(rank_h.min())}-{int(rank_h.max())} of {d['d_AB']}"
-                f"   (paper: 202-241 of 256)")
+                f"   (paper: 178-240 of 256)")
     _say(quiet, f"slopes past the onset             FPLS {_exponent(shots, med_f, onset):+.2f},"
                 f" PLS-QPT {_exponent(shots, med_h, onset):+.2f}")
     _say(quiet, "  (the guides are the PREDICTED rates 1/N and 1/sqrt(N), not fits;"
@@ -238,7 +241,7 @@ def fig_cost_ladder(data=None, outdir=None, quiet=False):
 
     One density estimate, calibrated to a fixed fidelity from the channel set,
     regularized three ways: the closed-form fidelity projection in Kraus form,
-    HIP at its authors' default tolerance, and the diamond-norm projection SDP.
+    HIP at its authors' default settings, and the diamond-norm projection SDP.
     Single-threaded, medians over ten instances.
     """
     d = _load("cost_ladder", data)
@@ -264,7 +267,7 @@ def fig_cost_ladder(data=None, outdir=None, quiet=False):
 
     med = {k: {r["d_AB"]: float(np.median(r["t"])) for r in d[k]} for k in ("hip", "fpls", "sdp")}
     _say(quiet, f"at d_AB = 2^10   HIP {med['hip'][1024]:8.1f} s   FPLS {med['fpls'][1024] * 1e3:6.2f} ms"
-                f"   (paper: 52 s against 0.28 ms)")
+                f"   (paper: 11.5 s against 0.28 ms)")
     _say(quiet, f"SDP              at 2^6 {med['sdp'][64]:5.1f} s     at 2^7 {med['sdp'][128]:5.1f} s"
                 f"      (paper: 19 s, 86 s)")
     _say(quiet, f"speed-up at 2^10 {med['hip'][1024] / med['fpls'][1024]:.2e}x")
@@ -282,7 +285,11 @@ def fig_hip_iterations(data=None, outdir=None, quiet=False):
     grows with dimension; every iteration is a d_AB-sized eigendecomposition.
     """
     d = _load("hip_iterations", data)
-    fig, axes = plt.subplots(1, 3, figsize=(9.4, 2.9), sharey=True)
+    # one panel per channel family in the data: three in the paper, fewer in a
+    # reduced live run, which would otherwise leave empty axes
+    n = len(d["panels"])
+    fig, axes = plt.subplots(1, n, figsize=(3.13 * n + 0.2 * (n == 1), 2.9), sharey=True, squeeze=False)
+    axes = axes[0]
     cmap = plt.get_cmap("viridis")
     for ax, panel in zip(axes, d["panels"]):
         for k, lev in enumerate(panel["levels"]):
@@ -305,8 +312,8 @@ def fig_hip_iterations(data=None, outdir=None, quiet=False):
     for panel in d["panels"]:
         fits = "  ".join(f"{l['fit']['a']:.1f} d^{l['fit']['b']:.2f}" for l in panel["levels"] if l["fit"])
         _say(quiet, f"{panel['family']:8s} {fits}")
-    _say(quiet, "paper: isometry 1.8 d^0.68, 2.3 d^0.62, 1.2 d^0.73, 0.9 d^0.76;"
-                " exponents 0.48/0.48/0.62/0.75 and 0.29/0.41/0.62/0.76")
+    _say(quiet, "paper: isometry 1.3 d^0.46, 1.5 d^0.41, 1.3 d^0.41, 1.2 d^0.39;"
+                " exponents 0.36/0.36/0.40/0.53 and 0.33/0.38/0.49/0.55")
     return fig
 
 
@@ -450,7 +457,7 @@ def fig_spectra(data=None, outdir=None, quiet=False):
     fig.tight_layout(w_pad=1.0, h_pad=0.4)
     fig.suptitle("True and estimated Choi spectra", y=1.02)
     save_figure(fig, "spectra", outdir)
-    _say(quiet, f"paper: FPLS returns 2 and 4; PLS-QPT returns 225 and 240 of 256")
+    _say(quiet, f"paper: FPLS returns 2 and 4; PLS-QPT returns 209 and 239 of 256")
     return fig
 
 def fig_accuracy(data=None, outdir=None, quiet=False):
@@ -462,36 +469,55 @@ def fig_accuracy(data=None, outdir=None, quiet=False):
     """
     d = _load("accuracy", data)
     shots = np.array(d["shots"], float)
-    series = (("fpls_beta", OURS, "o-", r"FPLS ($\tau=\beta_N$)"),
-              ("fpls_half", "#66AADD", "d-", r"FPLS ($\tau=\beta_N/2$)"),
-              ("pls_hip", HIP, "s--", "PLS"))
-    # One panel per metric, as in Fig. 5 of the paper.
-    METRICS = (("inf", "Choi infidelity", r"infidelity $1-\mathrm{F}(\rho,\hat\rho)$"),
-               ("tr", "Choi trace distance", r"trace distance $\frac{1}{2}\|\rho-\hat\rho\|_1$"),
-               ("fro", "Choi Frobenius distance", r"Frobenius distance $\|\rho-\hat\rho\|_2$"))
-    fig, axes = plt.subplots(1, 3, figsize=(10.2, 3.1))
+    # colours, markers and labels as in the paper's Fig. 5
+    series = (("fpls_beta", "tab:purple", "o-", r"FPLS, $\tau = \beta_N$"),
+              ("fpls_half", OURS, "o-", r"FPLS, $\tau = \beta_N/2$"),
+              ("pls_hip", HIP, "s--", r"PLS, $\tau = -\lambda_{\min}$"))
+    # The paper's Fig. 5: infidelity in a tall panel on the left, the two norms
+    # stacked on the right with a shared shot axis. Panel titles sit inside the
+    # frames and the y labels carry the formula alone, written between the Choi
+    # states of the true channel and of the channel estimate.
+    METRICS = (("inf", "Choi infidelity", r"$1-\mathrm{F}(\mathrm{C}(\Phi),\mathrm{C}(\hat\Phi))$"),
+               ("tr", "Choi trace distance", r"$\frac{1}{2}\|\mathrm{C}(\Phi)-\mathrm{C}(\hat\Phi)\|_1$"),
+               ("fro", "Choi Frob. distance", r"$\|\mathrm{C}(\Phi)-\mathrm{C}(\hat\Phi)\|_2$"))
+    fig = plt.figure(figsize=(8.6, 4.1))
+    gs = fig.add_gridspec(2, 2)
+    ax_inf = fig.add_subplot(gs[:, 0])
+    ax_tr = fig.add_subplot(gs[0, 1])
+    ax_fro = fig.add_subplot(gs[1, 1], sharex=ax_tr)
+    axes = (ax_inf, ax_tr, ax_fro)
+    # even powers of ten only, in the default (sans-serif) tick font
+    even = FuncFormatter(lambda v, _: rf"$\mathdefault{{10^{{{int(round(np.log10(v)))}}}}}$"
+                         if v > 0 and round(np.log10(v)) % 2 == 0
+                         and abs(np.log10(v) - round(np.log10(v))) < 1e-9 else "")
     onset_half = _onset(shots, _rows(d["fpls_half"], "rank"), d["true_rank"])
     for ax, (field, title, ylab) in zip(axes, METRICS):
         for key, colour, marker, label in series:
             _band(ax, shots, _rows(d[key], field), colour, marker, label, alpha=0.12)
         _shots_axis(ax)
-        ax.set(yscale="log", ylabel=ylab, title=title)
+        ax.set(yscale="log", ylabel=ylab)
+        ax.xaxis.set_major_locator(LogLocator(base=10, numticks=99))
+        ax.xaxis.set_major_formatter(even)
+        ax.text(0.975, 0.95, title, transform=ax.transAxes, ha="right", va="top", zorder=7,
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.85))
         # the guides carry the PREDICTED exponents, displaced off the curve they
         # describe and coloured like it in the infidelity panel, black in the norms
         if field == "inf":
+            ax.yaxis.set_major_locator(LogLocator(base=10, numticks=99))
+            ax.yaxis.set_major_formatter(even)
             _guide(ax, shots, _geomean(_rows(d["pls_hip"], "inf"))[0], -0.5,
                    r"$\propto N^{-1/2}$", HIP, bump=2.5)
             post = shots >= onset_half
             _guide(ax, shots[post], _geomean(_rows(d["fpls_half"], "inf"))[post][0], -1.0,
-                   r"$\propto N^{-1}$", "#66AADD", bump=0.35)
+                   r"$\propto N^{-1}$", OURS, bump=0.35)
         else:
             _guide(ax, shots, _geomean(_rows(d["pls_hip"], field))[0], -0.5,
                    r"$\propto N^{-1/2}$", "k", bump=2.2)
-    # one legend for all three panels, under the figure
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.tight_layout(rect=(0, 0.08, 1, 1))
-    fig.legend(handles, labels, loc="lower center", ncol=len(series), frameon=False,
-               bbox_to_anchor=(0.5, 0.0), columnspacing=2.4)
+    ax_tr.set_xlabel(""); ax_tr.tick_params(labelbottom=False)   # shared shot axis, labelled once
+    fig.tight_layout(h_pad=0.3, w_pad=0.8, rect=(0, 0, 1, 0.94))
+    fig.suptitle("Accuracy vs. measurement shots", y=0.995)
+    # one legend for all three panels, in the empty lower-left corner of the infidelity panel
+    ax_inf.legend(loc="lower left")
     save_figure(fig, "accuracy", outdir)
 
     # Every exponent is fitted from the onset upward: below it the thresholded
@@ -513,7 +539,7 @@ def fig_accuracy(data=None, outdir=None, quiet=False):
         return float(np.max(np.atleast_1d(num[idx]) / np.atleast_1d(den[idx])))
     _say(quiet, f"onsets: beta_N {onset['fpls_beta']:.0e}, beta_N/2 {onset['fpls_half']:.0e}"
                 f"        (paper: 1e6 and 3e5)")
-    for f, want in (("inf", "-1.00 and -0.50"), ("tr", "-0.50 and -0.49"), ("fro", "-0.50 and -0.50")):
+    for f, want in (("inf", "-1.00 and -0.51"), ("tr", "-0.50 and -0.50"), ("fro", "-0.50 and -0.50")):
         pls = f"{_exponent(shots, med['pls_hip'][f], o):+.2f}" if has_pls else "  n/a"
         _say(quiet, f"  exponent ({f:3s})  FPLS {_exponent(shots, med['fpls_beta'][f], o):+.2f}"
                     f"   PLS-QPT {pls}      (paper: {want})")
@@ -524,25 +550,25 @@ def fig_accuracy(data=None, outdir=None, quiet=False):
             i = int(np.argmin(np.abs(shots - N)))
             _say(quiet, f"  infidelity ratio at N = {N:.0e}   "
                         f"{med['pls_hip']['inf'][i] / med['fpls_beta']['inf'][i]:8.3g}x")
-        _say(quiet, "  (paper: 8x, 0.9e2, 1.0e3)")
+        _say(quiet, "  (paper: 6x, 49x, 520x)")
         for k in ("fpls_half", "fpls_beta"):
             j = int(np.where(shots == onset[k])[0][0]) if onset[k] in shots else None
             if j is None or j == 0:
                 _say(quiet, f"  {k:10s} its onset is the first shot count here, so there is no"
-                            f" pre-onset point   (paper: 3.4x and 6.0x)")
+                            f" pre-onset point   (paper: 4.9x at beta_N/2, 10.5x at beta_N)")
                 continue
             _say(quiet, f"  {k:10s} behind PLS-QPT by {med[k]['inf'][j - 1] / med['pls_hip']['inf'][j - 1]:.1f}x"
-                        f" at the last N before its onset   (paper: 3.4x and 6.0x)")
+                        f" at the last N before its onset   (paper: 4.9x at beta_N/2, 10.5x at beta_N)")
         _say(quiet, f"  at N = {shots[-1]:.0e} ahead by {med['pls_hip']['tr'][-1] / med['fpls_beta']['tr'][-1]:.1f}x in trace"
-                    f" and {med['pls_hip']['fro'][-1] / med['fpls_beta']['fro'][-1]:.1f}x in Frobenius   (paper: 1.5x, 1.3x)")
+                    f" and {med['pls_hip']['fro'][-1] / med['fpls_beta']['fro'][-1]:.1f}x in Frobenius   (paper: 1.2x, 1.1x)")
         pre = shots < onset["fpls_half"]
         _say(quiet, f"  before its onset beta_N/2 is behind by up to"
                     f" {fmt(ratio(med['fpls_half']['tr'], med['pls_hip']['tr'], pre))} in trace and"
                     f" {fmt(ratio(med['fpls_half']['fro'], med['pls_hip']['fro'], pre))} in Frobenius"
-                    f"   (paper: 2.0x, 3.0x)")
+                    f"   (paper: 2.2x, 3.3x)")
     else:
         _say(quiet, "  (the PLS baseline is absent, so the ratios against it are not shown;"
-                    f"\n   clone it to compute them: git clone {HIP_URL})")
+                    "\n   it ships in hip/, see sweeps.have_hip())")
     return fig
 
 
@@ -557,7 +583,10 @@ def _robustness(name, title, outdir, quiet, expect, data=None):
     """
     d = _load(name, data)
     cols = d["columns"]
-    Ns = [N for N in ("N1e+06", "N1e+10") if all(N in c.get("spectra", {}) for c in cols)]
+    # the shot counts whose spectra every column carries, in increasing order:
+    # 1e6 and 1e10 in the paper's data, whatever a live sweep was asked for otherwise
+    Ns = sorted({N for c in cols for N in c.get("spectra", {})}, key=lambda k: float(k[1:]))
+    Ns = [N for N in Ns if all(N in c.get("spectra", {}) for c in cols)]
     nrow = len(Ns) + 2
     fig, axes = plt.subplots(nrow, len(cols), figsize=(2.55 * len(cols), 1.9 * nrow),
                              squeeze=False)
@@ -568,21 +597,37 @@ def _robustness(name, title, outdir, quiet, expect, data=None):
             ax = axes[r, j]
             e = col["spectra"][N]
             idx = np.arange(1, col["d_AB"] + 1)
-            ax.bar(idx, np.clip(np.array(col["true_spectrum"]), 1e-16, None), width=1.0,
-                   color="#44AA99", alpha=0.55, label="true spectrum", zorder=1)
-            for key, colour, ls in (("fpls", OURS, "--"), ("pls_hip", HIP, "--")):
+            # The true spectrum as in the paper's Figs. 6-7: one seamless translucent
+            # fill (separate bars leave hairline gaps in PDF viewers) under outlined
+            # bars in the fill colour, the outline width halving every four indices
+            # from 0.8 pt and floored at 0.3 pt, drawn up to index 64.
+            spec = np.clip(np.array(col["true_spectrum"]), 1e-16, None)
+            edges = np.concatenate([idx - 0.5, [idx[-1] + 0.5]])
+            ax.fill_between(edges, 1e-16, np.append(spec, spec[-1]), step="post",
+                            facecolor=BAR, alpha=BAR_ALPHA, edgecolor="none", linewidth=0, zorder=1)
+            head = idx <= 64
+            ax.bar(idx[head], spec[head], width=1.0, facecolor="none", edgecolor=BAR,
+                   linewidth=np.maximum(0.8 * 2.0 ** (-(idx[head] - 1) / 4.0), 0.3), zorder=2)
+            for key, colour, z in (("fpls", OURS, 4), ("pls_hip", HIP, 3)):
+                if key not in e:        # a live sweep without the PLS baseline on disk
+                    continue
                 ax.step(idx, np.clip(np.array(e[key]["spectrum"]), 1e-16, None), where="mid",
-                        color=colour, ls=ls, lw=1.3, zorder=3,
+                        color=colour, ls="--", lw=1.4, zorder=z,
                         label=f"{'FPLS' if key == 'fpls' else 'PLS'}, rank {e[key]['rank']}")
-            ax.set(xscale="log", yscale="log", ylim=(1e-16, 4))
+            ax.set(xscale="log", yscale="log", ylim=(1e-15, 2))
             ax.set_xscale("log", base=2)
-            ax.xaxis.set_major_locator(LogLocator(base=2, numticks=4))
+            ax.xaxis.set_major_locator(FixedLocator([t for t in (1, 4, 16, 64) if t <= len(idx)]))
             ax.xaxis.set_major_formatter(LogFormatterSciNotation(base=2))
             ax.xaxis.set_minor_locator(LogLocator(base=2, subs=[]))
-            ax.legend(loc="lower left", fontsize=5.5, framealpha=0.85, borderpad=0.25,
-                      labelspacing=0.25, handlelength=1.4)
+            ax.yaxis.set_major_locator(LogLocator(base=10, numticks=4))
+            h, l = ax.get_legend_handles_labels()
+            if r == 0 and j == 0:       # the true-spectrum swatch, once, in the first panel
+                h = [Patch(facecolor=(*to_rgb(BAR), BAR_ALPHA), edgecolor=BAR, linewidth=0.8)] + h
+                l = ["true spectrum"] + l
+            ax.legend(h, l, loc="lower left", fontsize=5.5, framealpha=0.9, borderpad=0.3,
+                      labelspacing=0.3, handlelength=1.4)
             if j == 0:
-                ax.set_ylabel(f"$N = 10^{{{int(N[3:])}}}$", fontsize=7)
+                ax.set_ylabel(f"$N = 10^{{{int(round(np.log10(float(N[1:]))))}}}$", fontsize=7)
             if r == 0:
                 ax.set_title(col["label"], fontsize=8)
         # --- rank row
@@ -630,8 +675,8 @@ def fig_channel_robustness(data=None, outdir=None, quiet=False):
     recovers two decades before rank-8 amplitude damping.
     """
     return _robustness("channel_robustness", "Channels without full Choi rank", outdir, quiet,
-                       "onsets 3e5, 1e7, 1e9, 1e7; PLS-QPT 49-63 of 64 per trial;"
-                       " exponents -1.0 against -0.5 to -0.6", data)
+                       "onsets 3e5, 1e7, 1e9, 1e7; PLS-QPT 48-63 of 64 per trial;"
+                       " exponents -1.0 against -0.5 to -0.7", data)
 
 
 def fig_fullrank_tradeoff(data=None, outdir=None, quiet=False):
@@ -643,41 +688,41 @@ def fig_fullrank_tradeoff(data=None, outdir=None, quiet=False):
     every direction, is the better estimator here.
     """
     return _robustness("fullrank", "Channels with full Choi rank", outdir, quiet,
-                       "no FPLS onset within N <= 1e10.  The paper's \"ranks 51 to 64\" is the range of"
-                       "\n       the PLS-QPT estimates shown in the spectrum panels of Fig. 7, a different"
-                       "\n       set of estimates from the rank sweep summarised above", data)
+                       "no FPLS onset within N <= 1e10; PLS-QPT ranks 48 to 63 of 64", data)
 
 
 # ---------------------------------------------------------------------------
 # Table 1
 # ---------------------------------------------------------------------------
 def table_head_to_head(data=None, quiet=False):
-    """PLS-QPT against FPLS on the same N = 1e8 shots: fidelity, time, storage.
+    """PLS-QPT against FPLS on the same N = 1e8 shots: infidelity, time, storage.
 
-    Prints Table 1 of the paper. The storage columns are what the estimate
-    costs to keep: r Kraus operators for FPLS against a dense d_AB x d_AB
-    matrix for PLS-QPT, whose output is of nearly full rank.
+    Prints Table 1 of the paper. The storage columns are what the RETURNED
+    estimate costs to keep: r Kraus operators for FPLS against a dense
+    d_AB x d_AB matrix for PLS-QPT, whose output is of nearly full rank. The
+    d_A x d_A workspace the projection uses while it runs is not counted.
     """
     d = _load("table", data)
     med = lambda rs, f: float(np.median([r[f] for r in rs]))
-    head = (f"{'d_AB':>6} {'rank':>5} | {'F (PLS)':>10} {'F (FPLS)':>10} |"
+    head = (f"{'d_AB':>6} {'rank':>5} | {'1-F (PLS)':>10} {'1-F (FPLS)':>10} |"
             f" {'t (PLS)':>10} {'t (FPLS)':>10} {'ratio':>9} |"
             f" {'kB (PLS)':>9} {'kB (FPLS)':>10} {'ratio':>7}")
     lines = [head, "-" * len(head)]
     for r in d["rows"]:
         if "hip" not in r:      # a live table without the PLS baseline on disk
             f_f, t_f, b_f = med(r["fpls"], "F"), med(r["fpls"], "t"), med(r["fpls"], "bytes")
-            lines.append(f"{r['d_AB']:>6} {r['true_rank']:>5} | {'n/a':>10} {f_f:10.6f} |"
+            lines.append(f"{r['d_AB']:>6} {r['true_rank']:>5} | {'n/a':>10} {1 - f_f:10.1e} |"
                          f" {'n/a':>10} {t_f * 1e3:9.2f}ms {'n/a':>9} |"
                          f" {'n/a':>9} {b_f / 1e3:10.1f} {'n/a':>7}")
             continue
         f_h, f_f = med(r["hip"], "F"), med(r["fpls"], "F")
         t_h, t_f = med(r["hip"], "t"), med(r["fpls"], "t")
         b_h, b_f = med(r["hip"], "bytes"), med(r["fpls"], "bytes")
-        lines.append(f"{r['d_AB']:>6} {r['true_rank']:>5} | {f_h:10.6f} {f_f:10.6f} |"
-                     f" {t_h:9.3f}s {t_f * 1e3:9.2f}ms {t_h / t_f:8.0f}x |"
+        lines.append(f"{r['d_AB']:>6} {r['true_rank']:>5} | {1 - f_h:10.1e} {1 - f_f:10.1e} |"
+                     f" {(f'{t_h:9.2f}s' if t_h >= 1 else f'{t_h * 1e3:8.1f}ms'):>10} {t_f * 1e3:9.2f}ms {t_h / t_f:8.0f}x |"
                      f" {b_h / 1e3:9.1f} {b_f / 1e3:10.1f} {b_h / b_f:6.0f}x")
-    _say(quiet, f"N = {d['N']:.0e}, medians over {d['trials']} trials, HIP at tolerance {d['hip_tolerance']:g}")
+    _say(quiet, f"N = {d['N']:.0e}, medians over {d['trials']} trials, PLS-QPT at its authors' default settings")
     _say(quiet, "\n".join(lines))
-    _say(quiet, "\npaper Table 1: 0.99954 / 0.99999 at 2^6 rank 2, 16 ms against 0.03 ms, 66 kB against 3 kB;"
-                "\n               0.99666 / 0.99984 at 2^10 rank 2, 39 s against 0.37 ms, 16.8 MB against 49 kB")
+    _say(quiet, "\npaper Table 1: 8.1e-4 / 4.2e-6 at 2^6 rank 2, 3.6 ms against 0.02 ms, 66 kB against 2 kB;"
+                "\n               4.1e-3 / 1.6e-4 at 2^10 rank 2, 6.9 s against 0.29 ms, 16.8 MB against 33 kB;"
+                "\n               1.2e-2 / 4.6e-3 at 2^10 rank log2(d_AB), 3.7 s against 1.02 ms")

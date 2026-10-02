@@ -30,7 +30,7 @@ __all__ = [
     "make_rng", "paper_rng",
     "partial_trace_B", "matrix_sqrt", "matrix_inv_sqrt", "choi_rank",
     "fidelity", "infidelity", "trace_distance", "fidelity_to_channels",
-    "fidelity_projection", "choi_to_kraus", "kraus_to_choi",
+    "fidelity_projection", "choi_to_kraus", "kraus_from_eig", "kraus_to_choi",
     "normalise_kraus", "is_channel",
     "bernstein_radius", "threshold_density_estimate",
     "pauli_probs", "sample_frequencies", "ls_estimate", "simulate_ls_estimate",
@@ -125,8 +125,14 @@ def fidelity(P, Q):
     return float(np.sum(sla.svdvals(matrix_sqrt(P) @ matrix_sqrt(Q))))
 
 
-def infidelity(P, Q):
-    """1 - F(P, Q), clipped at 0 (F can exceed 1 by ~1e-15 on states)."""
+def infidelity(P, Q, tol=1e-8):
+    """1 - F(P, Q) for two states, clipped at 0 (F can exceed 1 by ~1e-15).
+
+    Both arguments must have unit trace: otherwise 1 - F is not an
+    infidelity, and the clip would hide the error.
+    """
+    for M in (P, Q):
+        assert abs(np.trace(M).real - 1.0) < tol, f"infidelity: trace {np.trace(M).real:.6g} != 1"
     return float(max(0.0, 1.0 - fidelity(P, Q)))
 
 
@@ -147,10 +153,10 @@ def fidelity_to_channels(rho, dA):
 
 
 # ---------------------------------------------------------------------------
-# The fidelity projection (Theorem 1) and its Kraus form (Theorem 6)
+# The fidelity projection (Theorem 1) and its Kraus form (Theorem 5)
 # ---------------------------------------------------------------------------
 def fidelity_projection(rho, dA):
-    """N_A(rho) = (1/d_A) (rho_A^{-1/2} (x) I_B) rho (rho_A^{-1/2} (x) I_B).
+    """N_A(rho) = (1/d_A) (rho_A^{-1/2} otimes I_B) rho (rho_A^{-1/2} otimes I_B).
 
     The partial normalization, which Theorem 1 identifies as the exact fidelity
     (equivalently Bures, equivalently purified-distance) projection of rho onto
@@ -162,16 +168,21 @@ def fidelity_projection(rho, dA):
     return (M @ rho @ M.conj().T) / dA
 
 
-def choi_to_kraus(rho, dA, dB, tol=EPS_ZERO):
-    """Kraus operators of the CP map with normalised Choi state rho.
+def kraus_from_eig(lam, vecs, dA, dB, tol=EPS_ZERO):
+    """Kraus operators from the eigenpairs of a normalised Choi state.
 
     Eigenvector |v_i> of eigenvalue lam_i, reshaped to a dA x dB array V_i,
     gives K_i = sqrt(dA lam_i) V_i^T of shape (dB, dA). Only the eigenvalues
     above `tol` are returned, so a rank-r Choi state yields r operators.
     """
+    keep = np.argsort(lam)[::-1]                   # descending
+    return [np.sqrt(dA * lam[i]) * vecs[:, i].reshape(dA, dB).T for i in keep if lam[i] > tol]
+
+
+def choi_to_kraus(rho, dA, dB, tol=EPS_ZERO):
+    """Kraus operators of the CP map with normalised Choi state rho."""
     lam, vecs = np.linalg.eigh(rho)
-    keep = np.nonzero(lam > tol)[0][::-1]          # descending
-    return [np.sqrt(dA * lam[i]) * vecs[:, i].reshape(dA, dB).T for i in keep]
+    return kraus_from_eig(lam, vecs, dA, dB, tol)
 
 
 def kraus_to_choi(Ks, dA, dB):
@@ -186,7 +197,7 @@ def kraus_to_choi(Ks, dA, dB):
 
 
 def normalise_kraus(Ks):
-    """K_i -> K_i R^{-1/2} with R = sum_i K_i^dag K_i (Theorem 6).
+    """K_i -> K_i R^{-1/2} with R = sum_i K_i^dag K_i (Theorem 5).
 
     The fidelity projection in Kraus form: it touches only the d_A x d_A defect
     R, so it costs O(r d_A^2 d_B + d_A^3) operations and O(r d_A d_B + d_A^2)
@@ -222,13 +233,15 @@ def bernstein_radius(d, N, delta=DELTA):
     return float(np.sqrt(8.0 * g * np.log(d / delta) / (3.0 * N)))
 
 
-def threshold_density_estimate(H, tau):
+def threshold_density_estimate(H, tau, return_eig=False):
     """Algorithm 3: nearest-unit-trace PSD matrix after thresholding at tau.
 
     Eigenvalues at or below tau are annihilated, survivors are boosted by tau,
     and the trace is restored: by a uniform water-filling subtraction if the
     boosted spectrum oversums, else by rescuing the raw eigenvalues top-down.
     tau = 0 is the Frobenius projection onto the density matrices.
+    With return_eig=True the eigenpairs (mu, vecs) of the estimate are returned
+    as well, which is all the Kraus form of the projection needs.
     """
     H = (H + H.conj().T) / 2
     lam, vecs = np.linalg.eigh(H)
@@ -267,7 +280,8 @@ def threshold_density_estimate(H, tau):
     mu = np.maximum(mu, 0.0)
     if mu.sum() > 1e-14:
         mu = mu / mu.sum()
-    return (vecs * mu) @ vecs.conj().T
+    rho_hat = (vecs * mu) @ vecs.conj().T
+    return (rho_hat, mu, vecs) if return_eig else rho_hat
 
 
 def lmin_density_estimate(H):
@@ -455,13 +469,21 @@ def random_channel_choi(dA, dB, r, rng):
 # ---------------------------------------------------------------------------
 # The protocol
 # ---------------------------------------------------------------------------
-def fpls(rho_true, N, rng, dA=None, c=1.0, delta=DELTA, kraus=False):
+def fpls(rho_true, N, rng, dA=None, c=1.0, delta=DELTA, dense=True):
     """Run FPLS-QPT end to end on simulated data and score the estimate.
 
     c scales the threshold, tau = c beta_N: c = 1 is the rule the guarantee is
-    proved for, c = 1/2 the heuristic the paper's figures use. With kraus=True
-    the TP regularization is done on Kraus operators (Theorem 6) instead of the
-    dense congruence; the two agree to machine precision.
+    proved for, c = 1/2 the heuristic the paper's figures use.
+
+    The TP regularization is done on Kraus operators (Theorem 5): the
+    eigenpairs of the density estimate are reshaped into Kraus operators and
+    normalised, K_i -> K_i R^{-1/2}, which never forms a d_AB x d_AB matrix.
+    The returned "kraus" list is the estimate in that form, one operator per
+    unit of Choi rank. The dense "estimate" used for scoring is, by default,
+    the dense congruence of Theorem 1 applied to the same density estimate (the
+    form the cached sweeps were computed with, so the numbers match them to
+    the bit); with dense=False it is assembled from the Kraus operators
+    instead. The two agree to machine precision.
 
     Returns a dict: the channel estimate and the quantities the figures plot.
     """
@@ -470,17 +492,14 @@ def fpls(rho_true, N, rng, dA=None, c=1.0, delta=DELTA, kraus=False):
     dB = d // dA
     beta = bernstein_radius(d, N, delta)
     rho_ls = simulate_ls_estimate(rho_true, N, rng)
-    rho_hat = threshold_density_estimate(rho_ls, tau=c * beta)
-    if kraus:
-        Ks = normalise_kraus(choi_to_kraus(rho_hat, dA, dB))
-        est = kraus_to_choi(Ks, dA, dB)
-    else:
-        Ks = None
-        est = fidelity_projection(rho_hat, dA)
+    rho_hat, mu, vecs = threshold_density_estimate(rho_ls, tau=c * beta, return_eig=True)
+    Ks = normalise_kraus(kraus_from_eig(mu, vecs, dA, dB))
+    est = fidelity_projection(rho_hat, dA) if dense else kraus_to_choi(Ks, dA, dB)
     return {"estimate": est, "kraus": Ks, "beta_N": beta,
             "noise": float(np.abs(np.linalg.eigvalsh(rho_ls - rho_true)).max()),
             "rank": choi_rank(est), "infidelity": infidelity(rho_true, est),
-            "trace_distance": trace_distance(rho_true, est)}
+            "trace_distance": trace_distance(rho_true, est),
+            "bytes": 16 * sum(K.size for K in Ks)}
 
 
 # ---------------------------------------------------------------------------
@@ -508,9 +527,13 @@ _STYLE = {
 
 def use_style():
     """Apply the paper's matplotlib style (ggplot + _STYLE) and return pyplot."""
+    import logging
     import matplotlib.pyplot as plt
     plt.style.use("ggplot")
     plt.rcParams.update(_STYLE)
+    # Embedding the Computer Modern fonts as Type 42 makes fontTools warn about their
+    # (harmless) 1990s file timestamps on every PDF written; silence just that warning.
+    logging.getLogger("fontTools.ttLib.tables._h_e_a_d").setLevel(logging.ERROR)
     return plt
 
 
