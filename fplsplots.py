@@ -11,6 +11,7 @@ counts to 1e10 -- so they ship as data. Everything the algorithm itself does is
 in fpls.py and runs live; see the notebook's worked example.
 """
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,7 @@ BAR, BAR_ALPHA = "#44AA99", 0.5     # the true-spectrum fill of Figs. 6-7 (teal)
 __all__ = ["fig_headline", "fig_cost_ladder", "fig_hip_iterations",
            "fig_threshold_strategies", "fig_spectra", "fig_accuracy",
            "fig_channel_robustness", "fig_fullrank_tradeoff",
-           "table_head_to_head"]
+           "fig_contraction", "table_head_to_head"]
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +97,9 @@ def _exponent(x, y, lo=None):
     x, y = np.asarray(x, float), np.asarray(y, float)
     m = np.ones_like(x, bool) if lo is None else (x >= lo)
     m &= y > 0
-    return float(np.polyfit(np.log10(x[m]), np.log10(y[m]), 1)[0])
+    with warnings.catch_warnings():          # few points in a small live sweep
+        warnings.simplefilter("ignore", np.exceptions.RankWarning)
+        return float(np.polyfit(np.log10(x[m]), np.log10(y[m]), 1)[0])
 
 
 def _guide(ax, x, y, exponent, text, colour, bump=1.0):
@@ -692,6 +695,61 @@ def fig_fullrank_tradeoff(data=None, outdir=None, quiet=False):
 
 
 # ---------------------------------------------------------------------------
+# Figure 9: the lifting loss in practice
+# ---------------------------------------------------------------------------
+def fig_contraction(data=None, outdir=None, quiet=False):
+    """Bures ratio of the fidelity projection on tomography estimates.
+
+    Theorem 1 allows the projection to double the Bures distance to the true
+    Choi state; on tomography estimates it barely moves it, and for low-rank
+    channels it brings the estimate closer.
+    """
+    d = _load("contraction", data)
+    rows = d["rows"]
+    order = ["rank 1 (isometry)", "rank 2", r"rank $\log_2 d_{\mathsf{AB}}$", "full rank (BCSZ)",
+             "amplitude damping", "isometry + 1% depol.", "isometry + 5% depol.",
+             r"flat, rank $\approx\sqrt{d_{\mathsf{AB}}}$"]
+    fams = [f for f in order if any(r["family"] == f for r in rows)]
+    cols = dict(zip(fams, ["#004488", "#DDAA33", "#BB5566", "#333333", "#44AA99", "#EE7733",
+                           "#AA4499", "#88CCEE"]))
+    offs = dict(zip(fams, np.linspace(-0.24, 0.24, len(fams))))
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    for f in fams:
+        rr = [r for r in rows if r["family"] == f]
+        x = np.array([np.log2(r["d_AB"]) for r in rr]) + offs[f]
+        y = np.array([r["bures_ratio"] for r in rr])
+        up = y > 1                       # contractive: translucent; expansive: opaque, white edge
+        ax.scatter(2 ** x[~up], y[~up], s=40, alpha=0.35, color=cols[f], edgecolors="none", zorder=2)
+        ax.scatter(2 ** x[up], y[up], s=48, alpha=1.0, color=cols[f], edgecolors="white",
+                   linewidths=0.7, zorder=3)
+        ax.scatter([], [], s=30, color=cols[f], label=f)          # legend entry in full colour
+    ax.axhline(2, ls="--", color="k", lw=1)
+    ax.text(4, 1.96, "Thm. 1 bound", fontsize=9, va="top")
+    ax.axhline(1, ls=":", color="k", lw=1)
+    ax.set_xscale("log", base=2)
+    ax.set_ylim(0, 2.15)
+    ax.set(xlabel=r"Choi dimension $d_{\mathsf{AB}}$",
+           ylabel=r"$\mathrm{d_B}(\rho,\Pi_{\mathcal{C}}(\hat\rho))\,/\,\mathrm{d_B}(\rho,\hat\rho)$")
+    ax.legend(fontsize=10, loc="upper right", bbox_to_anchor=(1.0, 0.93), ncol=2, markerscale=1.0,
+              handletextpad=0.3, columnspacing=1.0, framealpha=0.9)
+    fig.tight_layout()
+    save_figure(fig, "contraction", outdir)
+
+    b = np.array([r["bures_ratio"] for r in rows])
+    k = np.array([r["kappa"] for r in rows])
+    _say(quiet, f"{len(rows)} instances: Bures ratio {b.min():.2f} to {b.max():.2f}, median {np.median(b):.2f};"
+                f" infidelity ratio {k.min():.2f} to {k.max():.2f}")
+    for f in fams:
+        bf = np.array([r["bures_ratio"] for r in rows if r["family"] == f])
+        name = (f.replace(r"\log_2 d_{\mathsf{AB}}", "log2 d_AB")
+                 .replace(r"\approx\sqrt{d_{\mathsf{AB}}}", "~ sqrt(d_AB)").replace("$", ""))
+        _say(quiet, f"  {name:26s} median {np.median(bf):.3f}   max {bf.max():.4f}")
+    _say(quiet, "paper: 870 instances, Bures ratio 0.45 to 1.01, median 0.99; infidelity ratio 0.20 to 1.02;"
+                "\n       about 0.8 for isometries; above 1 only for full rank (by at most 0.03%) and amplitude damping")
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Table 1
 # ---------------------------------------------------------------------------
 def table_head_to_head(data=None, quiet=False):
@@ -704,25 +762,35 @@ def table_head_to_head(data=None, quiet=False):
     """
     d = _load("table", data)
     med = lambda rs, f: float(np.median([r[f] for r in rs]))
-    head = (f"{'d_AB':>6} {'rank':>5} | {'1-F (PLS)':>10} {'1-F (FPLS)':>10} |"
-            f" {'t (PLS)':>10} {'t (FPLS)':>10} {'ratio':>9} |"
-            f" {'kB (PLS)':>9} {'kB (FPLS)':>10} {'ratio':>7}")
-    lines = [head, "-" * len(head)]
+    sec = lambda t: f"{t:.2f}s" if t >= 1 else f"{t * 1e3:.1f}ms"
+    size = lambda b: f"{b / 1e6:.1f}MB" if b >= 1e6 else f"{b / 1e3:.1f}kB"
+    cols = [("d_AB", 6), ("rank", 5), ("|", 1), ("1-F (PLS)", 10), ("1-F (FPLS)", 10), ("|", 1),
+            ("t (PLS)", 10), ("t (FPLS)", 10), ("ratio", 9), ("|", 1),
+            ("PLS", 9), ("FPLS", 10), ("ratio", 7)]
+
+    def line(*vals):
+        """One table row; vals are the ten entries, the bars are added here."""
+        it = iter(vals)
+        return " ".join(("|" if name == "|" else str(next(it))).rjust(w) for name, w in cols)
+
+    head = line(*[n for n, _ in cols if n != "|"])
+    rows = []
     for r in d["rows"]:
+        f_f, t_f, b_f = med(r["fpls"], "F"), med(r["fpls"], "t"), med(r["fpls"], "bytes")
         if "hip" not in r:      # a live table without the PLS baseline on disk
-            f_f, t_f, b_f = med(r["fpls"], "F"), med(r["fpls"], "t"), med(r["fpls"], "bytes")
-            lines.append(f"{r['d_AB']:>6} {r['true_rank']:>5} | {'n/a':>10} {1 - f_f:10.1e} |"
-                         f" {'n/a':>10} {t_f * 1e3:9.2f}ms {'n/a':>9} |"
-                         f" {'n/a':>9} {b_f / 1e3:10.1f} {'n/a':>7}")
+            rows.append(line(r["d_AB"], r["true_rank"], "n/a", f"{1 - f_f:.1e}", "n/a",
+                             f"{t_f * 1e3:.2f}ms", "n/a", "n/a", size(b_f), "n/a"))
             continue
-        f_h, f_f = med(r["hip"], "F"), med(r["fpls"], "F")
-        t_h, t_f = med(r["hip"], "t"), med(r["fpls"], "t")
-        b_h, b_f = med(r["hip"], "bytes"), med(r["fpls"], "bytes")
-        lines.append(f"{r['d_AB']:>6} {r['true_rank']:>5} | {1 - f_h:10.1e} {1 - f_f:10.1e} |"
-                     f" {(f'{t_h:9.2f}s' if t_h >= 1 else f'{t_h * 1e3:8.1f}ms'):>10} {t_f * 1e3:9.2f}ms {t_h / t_f:8.0f}x |"
-                     f" {b_h / 1e3:9.1f} {b_f / 1e3:10.1f} {b_h / b_f:6.0f}x")
+        f_h, t_h, b_h = med(r["hip"], "F"), med(r["hip"], "t"), med(r["hip"], "bytes")
+        rows.append(line(r["d_AB"], r["true_rank"], f"{1 - f_h:.1e}", f"{1 - f_f:.1e}", sec(t_h),
+                         f"{t_f * 1e3:.2f}ms", f"{t_h / t_f:.0f}x", size(b_h), size(b_f), f"{b_h / b_f:.0f}x"))
+    # Table 1 of the paper, as printed there (its ratios are of the unrounded values)
+    paper = [line(64, 2, "8.1e-04", "4.2e-06", "3.6ms", "0.02ms", "190x", "66kB", "2kB", "32x"),
+             line(1024, 2, "4.1e-03", "1.6e-04", "6.9s", "0.29ms", "2.4e4x", "16.8MB", "33kB", "512x"),
+             line(64, 6, "1.0e-03", "4.2e-05", "3.3ms", "0.03ms", "120x", "66kB", "6kB", "11x"),
+             line(1024, 10, "1.2e-02", "4.6e-03", "3.7s", "1.02ms", "3.6e3x", "16.8MB", "164kB", "102x")]
+    rule = "-" * len(head)
     _say(quiet, f"N = {d['N']:.0e}, medians over {d['trials']} trials, PLS-QPT at its authors' default settings")
-    _say(quiet, "\n".join(lines))
-    _say(quiet, "\npaper Table 1: 8.1e-4 / 4.2e-6 at 2^6 rank 2, 3.6 ms against 0.02 ms, 66 kB against 2 kB;"
-                "\n               4.1e-3 / 1.6e-4 at 2^10 rank 2, 6.9 s against 0.29 ms, 16.8 MB against 33 kB;"
-                "\n               1.2e-2 / 4.6e-3 at 2^10 rank log2(d_AB), 3.7 s against 1.02 ms")
+    _say(quiet, "\n".join([head, rule] + rows))
+    _say(quiet, "\npaper Table 1 (N = 1e8, d_AB = 64 and 1024, Choi rank 2 and log2 d_AB):")
+    _say(quiet, "\n".join([head, rule] + paper))

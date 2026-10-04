@@ -32,11 +32,13 @@ fidelity projection -- is always computed live.
 from __future__ import annotations
 
 import json
+import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
 
-from fpls import (local_depolarizing_choi, qft_bcsz_choi, DELTA, PAPER_SEED, amplitude_damping_choi, bernstein_radius,
+from fpls import (partial_trace_B, local_depolarizing_choi, qft_bcsz_choi, fidelity, DELTA, PAPER_SEED, amplitude_damping_choi, bernstein_radius,
                   choi_rank, choi_to_kraus, depolarizing_choi, fidelity_projection,
                   fidelity_to_channels, infidelity, kraus_to_choi,
                   lmin_density_estimate, normalise_kraus, paper_rng, qft_choi,
@@ -52,7 +54,7 @@ PAPER_SHOTS = [1e4, 1e5, 10 ** 5.5, 1e6, 10 ** 6.5, 1e7,
 __all__ = ["PAPER_SHOTS", "HIP_URL", "HIP_FILE", "have_hip", "pls_estimate", "hip_regularize", "channel",
            "sweep_headline", "sweep_accuracy", "sweep_spectra", "sweep_thresholds",
            "sweep_robustness", "sweep_cost_ladder", "sweep_hip_iterations",
-           "sweep_table", "check_proj_TP"]
+           "sweep_table", "sweep_contraction", "check_proj_TP", "check_diamond_sdp"]
 
 
 # ---------------------------------------------------------------------------
@@ -213,15 +215,49 @@ def _split_dims(spec):
 _PROGRESS_WIDTH = 78
 
 
+class _Line:
+    """Plain text for IPython's display, shown without quotes."""
+    def __init__(self, text):
+        self.text = text
+
+    def __repr__(self):
+        return self.text
+
+
+_LINE = None          # (display handle, last message) of the notebook's progress line
+
+
 def _progress(msg=""):
     """Overwrite the current progress line with `msg`.
 
-    The line is padded with spaces to a fixed width, so a shorter message fully
-    replaces a longer one instead of leaving its tail behind. Called with no
-    argument it clears the line.
+    In a terminal the line is rewritten in place with a carriage return, padded
+    to a fixed width so that a shorter message fully replaces a longer one, and
+    a call with no argument clears it. In a notebook a carriage return would
+    leave every overwritten version behind as a blank line, so the line is a
+    display updated in place instead, and a call with no argument marks it done.
     """
-    print("\r" + f"  {msg}"[:_PROGRESS_WIDTH].ljust(_PROGRESS_WIDTH) + ("" if msg else "\r"),
-          end="", flush=True)
+    global _LINE
+    if sys.stdout.isatty():
+        print("\r" + f"  {msg}"[:_PROGRESS_WIDTH].ljust(_PROGRESS_WIDTH) + ("" if msg else "\r"),
+              end="", flush=True)
+        return
+    try:
+        from IPython import get_ipython
+        from IPython.display import display
+    except ImportError:
+        return
+    if get_ipython() is None:
+        return
+    if not msg:
+        if _LINE is not None and not _LINE[1].endswith("done"):
+            _LINE[0].update(_Line(f"  {_LINE[1]}: done"))
+        _LINE = None                         # the next sweep starts a line of its own
+        return
+    if _LINE is None:
+        _LINE = (display(_Line(f"  {msg}"), display_id=True), msg)
+    else:
+        _LINE[0].update(_Line(f"  {msg}"))
+        _LINE = (_LINE[0], msg)
 
 
 def _estimate(rho_ls, rho_true, dA, rule, beta):
@@ -255,7 +291,8 @@ def _shot_key(N):
     return int(np.log10(int(N)) * 10)
 
 
-def _sweep(rho, shots, trials, rules, seed, fields=("rank", "inf"), progress=True, stream=4):
+def _sweep(rho, shots, trials, rules, seed, fields=("rank", "inf"), progress=True, stream=4,
+           label="", finish=True):
     """{rule: {field: [[trial, ...] per shot count]}} over a shot grid.
 
     One least-squares estimate per (shot count, trial) is shared by every rule,
@@ -281,8 +318,8 @@ def _sweep(rho, shots, trials, rules, seed, fields=("rank", "inf"), progress=Tru
                 for f in fields:
                     out[rule][f][i].append(vals[f])
         if progress:
-            _progress(f"N = 1e{np.log10(N):g}  ({i + 1} of {len(shots)} shot counts)")
-    if progress:
+            _progress(f"{label}N = 1e{np.log10(N):g}  ({i + 1} of {len(shots)} shot counts)")
+    if progress and finish:
         _progress()
     return out
 
@@ -362,11 +399,15 @@ def sweep_thresholds(channels=(("rank2", None), ("amp_damping_r2", None)),
     for name, label, *own in channels:      # an optional third entry overrides nq for that channel
         rho = channel(name, own[0] if own else nq, seed)
         lam = np.linalg.eigvalsh(rho)
-        res = _sweep(rho, shots, trials, rules, seed, progress=progress, stream=2)
+        res = _sweep(rho, shots, trials, rules, seed, progress=progress, stream=2,
+                     label=f"{name}: ", finish=False)
         panels.append({"label": label or f"{name}, $d_{{AB}} = {rho.shape[0]}$",
                        "d_AB": rho.shape[0], "true_rank": choi_rank(rho),
                        "lambda_r": float(lam[lam > 1e-10].min()),
                        "shots": shots, **res})
+    if progress:
+        _progress(f"{len(channels)} channels, {len(shots)} shot counts each")
+        _progress()
     return {"panels": panels}
 
 
@@ -435,7 +476,8 @@ def sweep_robustness(channels, nq=3, shots=None, trials=3, seed=PAPER_SEED,
         d = rho.shape[0]
         dA = int(round(np.sqrt(d)))
         rules = (rule, "pls_hip") if have_hip() else (rule,)
-        res = _sweep(rho, shots, trials, rules, seed, progress=progress)
+        res = _sweep(rho, shots, trials, rules, seed, progress=progress,
+                     label=f"{name}: ", finish=False)
         col = {"label": label, "d_AB": d, "true_rank": choi_rank(rho),
                "shots": shots, "fpls": res[rule]}
         if "pls_hip" in res:
@@ -456,6 +498,9 @@ def sweep_robustness(channels, nq=3, shots=None, trials=3, seed=PAPER_SEED,
                         entry[key] = {"spectrum": desc(est), "rank": choi_rank(est)}
                 col["spectra"][f"N{N:.0e}"] = entry
         cols.append(col)
+    if progress:
+        _progress(f"{len(channels)} channels, {len(shots)} shot counts each")
+        _progress()
     return {"columns": cols}
 
 
@@ -548,8 +593,13 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
     Times, on this machine, the same calibrated density estimate regularized
     two or three ways: the closed-form fidelity projection in Kraus form, HIP at
     its authors' default settings, and, with sdp=True, the diamond-norm
-    projection semidefinite program (needs cvxpy, and is the reason the paper
-    stops at d_AB = 2^7 for that curve).
+    projection semidefinite program, solved by the paper's rules (`_time_sdp`;
+    needs cvxpy, clarabel and scs).
+
+    WARNING: sdp=True is SLOW and is therefore off by default: about 20 s per
+    instance at d_AB = 2^6 and 90 s at 2^7, several hours for the paper's
+    ladder; it is why the paper stops that curve at d_AB = 2^7.
+    `check_diamond_sdp()` verifies the SDP against three closed forms first.
 
     Rectangular dimensions. The authors' proj_TP reshapes into four axes of
     equal length and so assumes d_A = d_B; `pls.proj_TP_for` generalizes it, and
@@ -573,6 +623,8 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
     reproduces.
     """
     import time
+    if sdp:
+        warnings.warn(_SDP_WARNING, stacklevel=2)
     out = {"target_purified_distance": target_dpu, "hip_settings": "authors' default",
            "note": "one TP regularization of one calibrated density estimate, timed live",
            "hip": [], "fpls": [], "sdp": []}
@@ -599,8 +651,11 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
                 iters.append(info["iters"])
             out["hip"].append({"d_AB": d_AB, "t": ts, "iters": iters, "N": [x[1] for x in insts]})
         if sdp and d_AB <= sdp_max:     # the SDP is out of reach beyond 2^7 (hours per instance)
-            ts = [_time_sdp(rho_hat, dA, dB) for rho_hat, *_ in insts]
-            out["sdp"].append({"d_AB": d_AB, "t": ts})
+            res = [_time_sdp(rho_hat, dA, dB) for rho_hat, *_ in insts]
+            ok = [r for r in res if r is not None]
+            out["sdp"].append({"d_AB": d_AB, "t": [r["t"] for r in ok],
+                               "objective": [r["objective"] for r in ok],
+                               "solver": [r["solver"] for r in ok], "invalid": len(res) - len(ok)})
     if progress:
         _progress()
     for k in ("hip", "sdp"):                      # an absent arm is dropped, not empty
@@ -609,13 +664,56 @@ def sweep_cost_ladder(dims=(4, 16, 64), target_dpu=0.05, trials=3, seed=PAPER_SE
     return out
 
 
-def _time_sdp(rho_hat, dA, dB):
-    """One diamond-norm projection, timed. Needs cvxpy; see sweep_cost_ladder."""
-    import time
+# The diamond-norm projection SDP of Fig. 2 (left), run by the paper's rules.
+# SLOW: seconds per instance at d_AB = 2^4, about 20 s at 2^6 and 90 s at 2^7,
+# and several hours for the ladder with 10 trials; it is therefore never run
+# unless asked for (sweep_cost_ladder(sdp=True)).
+SDP_SETTINGS = [                    # (solver, label, options): the defaults and one alternative each
+    ("CLARABEL", "default", {}),
+    ("CLARABEL", "tol1e-7", dict(tol_gap_abs=1e-7, tol_gap_rel=1e-7, tol_feas=1e-7)),
+    ("SCS", "default", {}),
+    ("SCS", "eps1e-9", dict(eps_abs=1e-9, eps_rel=1e-9, max_iters=200_000)),
+]
+SDP_MARGINAL_TOL = 1e-6             # a run counts only if its output is a channel to this accuracy
+SDP_MIN_EIG_TOL = -1e-6
+SDP_REPS = 3                        # timing repetitions; the fastest is reported
+
+_SDP_WARNING = ("the diamond-norm SDP is slow: about 20 s per instance at d_AB = 2^6 and 90 s "
+                "at 2^7, several hours for the paper's ladder")
+
+
+def _cvxpy():
     try:
         import cvxpy as cp
     except ImportError as exc:                    # pragma: no cover
-        raise RuntimeError("the SDP curve needs cvxpy: pip install cvxpy") from exc
+        raise RuntimeError("the SDP needs cvxpy, clarabel and scs: "
+                           "pip install cvxpy clarabel scs") from exc
+    return cp
+
+
+def _diamond_norm_problem(Delta, dA, dB):
+    """Watrous' SDP for the diamond norm of a Hermiticity-preserving map given
+    its unnormalised Choi operator Delta on A (x) B (A, the input, first):
+        minimize y  s.t.  Z + Delta >= 0,  Z - Delta >= 0,  Tr_B Z <= y I_A.
+    """
+    cp = _cvxpy()
+    n = dA * dB
+    Z = cp.Variable((n, n), hermitian=True)
+    y = cp.Variable()
+    cons = [Z + Delta >> 0, Z - Delta >> 0,
+            cp.partial_trace(Z, (dA, dB), 1) << y * np.eye(dA)]
+    return cp.Problem(cp.Minimize(y), cons)
+
+
+def _projection_problem(rho_hat, dA, dB):
+    """The diamond-norm projection of the Choi state rho_hat onto the channels:
+    the SDP above applied to sigma - rho_hat, with sigma a variable constrained
+    to be the Choi state of a channel. Returns (problem, sigma).
+
+    y is deliberately not declared nonnegative, though it is: the redundant cone
+    makes Clarabel stall at reduced accuracy.
+    """
+    cp = _cvxpy()
     n = dA * dB
     sigma = cp.Variable((n, n), hermitian=True)
     Z = cp.Variable((n, n), hermitian=True)
@@ -625,10 +723,104 @@ def _time_sdp(rho_hat, dA, dB):
             cp.partial_trace(sigma, (dA, dB), 1) == np.eye(dA) / dA,
             Z + Delta >> 0, Z - Delta >> 0,
             cp.partial_trace(Z, (dA, dB), 1) << y * np.eye(dA)]
-    prob = cp.Problem(cp.Minimize(y), cons)
-    t0 = time.perf_counter()
-    prob.solve()
-    return time.perf_counter() - t0
+    return cp.Problem(cp.Minimize(y), cons), sigma
+
+
+def check_diamond_sdp(rng=None, verbose=True):
+    """The diamond-norm SDP against three closed forms (a few seconds).
+
+      (a) a completely positive map Psi:  ||Psi||_diamond = ||Tr_B J||_inf;
+      (b) two replacer channels X -> Tr(X) rho_i:  ||Psi_0 - Psi_1||_diamond
+          = ||rho_0 - rho_1||_1;
+      (c) two unitary channels:  ||Psi_U - Psi_V||_diamond = 2 sqrt(1 - nu^2),
+          nu the distance from 0 to the convex hull of the spectrum of U^dag V.
+    """
+    cp = _cvxpy()
+    rng = np.random.default_rng(0) if rng is None else rng
+    solve = lambda prob: prob.solve(solver="SCS", eps_abs=1e-10, eps_rel=1e-10)
+    worst = {}
+    err = 0.0                                                     # (a)
+    for dA, dB in ((2, 2), (2, 4), (3, 2)):
+        n = dA * dB
+        G = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+        J = G @ G.conj().T
+        ref = np.linalg.eigvalsh(np.trace(J.reshape(dA, dB, dA, dB), axis1=1, axis2=3)).max()
+        err = max(err, abs(solve(_diamond_norm_problem(J, dA, dB)) - ref) / ref)
+    worst["completely positive map"] = err
+    err = 0.0                                                     # (b)
+    for d in (2, 3, 4):
+        def rand_state():
+            G = rng.standard_normal((d, d)) + 1j * rng.standard_normal((d, d))
+            R = G @ G.conj().T
+            return R / np.trace(R).real
+        r0, r1 = rand_state(), rand_state()
+        ref = np.abs(np.linalg.eigvalsh(r0 - r1)).sum()
+        err = max(err, abs(solve(_diamond_norm_problem(np.kron(np.eye(d), r0 - r1), d, d)) - ref) / ref)
+    worst["replacer channels"] = err
+    err = 0.0                                                     # (c)
+    for d in (2, 3):
+        def haar():
+            G = rng.standard_normal((d, d)) + 1j * rng.standard_normal((d, d))
+            Q, R = np.linalg.qr(G)
+            return Q * (np.diag(R) / np.abs(np.diag(R)))
+
+        def choi_op(U):                          # unnormalised, A (x) B, A first
+            J = np.zeros((d * d, d * d), complex)
+            for a in range(d):
+                for b in range(d):
+                    E = np.zeros((d, d))
+                    E[a, b] = 1.0
+                    J += np.kron(E, U @ E @ U.conj().T)
+            return J
+        U, V = haar(), haar()
+        ev = np.linalg.eigvals(U.conj().T @ V)
+        P = np.vstack([ev.real, ev.imag])        # nu: a small QP over the simplex
+        w = cp.Variable(d, nonneg=True)
+        nu = cp.Problem(cp.Minimize(cp.norm(P @ w, 2)), [cp.sum(w) == 1]).solve(solver="CLARABEL")
+        ref = 2 * np.sqrt(max(0.0, 1 - nu ** 2))
+        err = max(err, abs(solve(_diamond_norm_problem(choi_op(U) - choi_op(V), d, d)) - ref) / max(ref, 1e-12))
+    worst["unitary channels"] = err
+    if verbose:
+        for k, v in worst.items():
+            print(f"  diamond-norm SDP vs closed form, {k:24s} relative error {v:.1e}")
+    assert max(worst.values()) < 1e-6, worst
+    return worst
+
+
+def _time_sdp(rho_hat, dA, dB, reps=SDP_REPS):
+    """One diamond-norm projection, timed by the paper's rules. SLOW; see above.
+
+    The instance is solved with Clarabel and SCS, each at its defaults and at
+    one alternative setting (below d_AB = 64; from there on SCS only, since
+    Clarabel's interior point is already the slower one at 16 and 32). A run
+    counts only if the returned sigma is a channel to 1e-6 in its marginal and
+    its least eigenvalue; the time reported is the fastest valid run's own
+    solver time, best of `reps`, which excludes cvxpy's modelling overhead.
+    Returns {"t", "objective", "solver"}, or None if no run was valid.
+    """
+    best = None
+    settings = SDP_SETTINGS if dA * dB < 64 else [x for x in SDP_SETTINGS if x[0] == "SCS"]
+    for solver, label, kw in settings:
+        t_min, value, sig = np.inf, None, None
+        try:
+            for _ in range(reps):
+                prob, sigma = _projection_problem(rho_hat, dA, dB)
+                with warnings.catch_warnings():      # inaccurate solves are caught by the validity test
+                    warnings.simplefilter("ignore")
+                    prob.solve(solver=solver, warm_start=False, **kw)
+                st = getattr(prob.solver_stats, "solve_time", None)
+                t_min = min(t_min, st if st is not None else np.inf)
+                value, sig = prob.value, sigma.value
+        except Exception:                          # a failed solver is one invalid run
+            continue
+        if sig is None or not np.isfinite(t_min):
+            continue
+        S = (sig + sig.conj().T) / 2
+        marg = np.abs(partial_trace_B(S, dA, dB) - np.eye(dA) / dA).max()
+        if marg < SDP_MARGINAL_TOL and np.linalg.eigvalsh(S).min() > SDP_MIN_EIG_TOL:
+            if best is None or t_min < best["t"]:
+                best = {"t": float(t_min), "objective": float(value), "solver": f"{solver}/{label}"}
+    return best
 
 
 def sweep_hip_iterations(dims=(4, 16, 64), targets=(0.05, 0.1, 0.2, 0.3),
@@ -741,7 +933,106 @@ def sweep_table(dims=(16, 64), N=1e6, trials=3, families=("rank2", "logrank"),
             row["hip"] = hp
         rows.append(row)
         if progress:
-            _progress(f"{fam}, d_AB = {d_AB} done")
+            _progress(f"{fam}, d_AB = {d_AB}")
     if progress:
         _progress()
     return {"N": N, "trials": trials, "hip_settings": "authors' default", "rows": rows}
+
+
+# ---------------------------------------------------------------------------
+# Fig. 9: the lifting loss in practice
+# ---------------------------------------------------------------------------
+def _haar_isometry(dA, dB, rng):
+    """A Haar-random isometry C^dA -> C^dB, as a dB x dA matrix."""
+    G = rng.standard_normal((dB, dA)) + 1j * rng.standard_normal((dB, dA))
+    Q, R = np.linalg.qr(G)
+    return Q * (np.diag(R) / np.abs(np.diag(R)))
+
+
+def _kraus_choi(Ks, dA, dB):
+    """Normalised Choi state of a channel from its Kraus operators (dB x dA)."""
+    J = np.zeros((dA * dB, dA * dB), complex)
+    for M in Ks:
+        v = np.concatenate([M[:, a] for a in range(dA)]) / np.sqrt(dA)
+        J += np.outer(v, v.conj())
+    return J
+
+
+def _amp_damping_rect(dA, dB, r, rng):
+    """Independent amplitude damping on log2(r) of the input qubits, identity on
+    the rest, followed (when d_B = 2 d_A) by an output qubit appended in |0>.
+    Choi rank r, at square and rectangular dimensions alike."""
+    nA, k = int(np.log2(dA)), int(np.log2(r))
+    g = rng.uniform(0.15, 0.45, size=k)
+    K = [[np.array([[1, 0], [0, np.sqrt(1 - gi)]], complex),
+          np.array([[0, np.sqrt(gi)], [0, 0]], complex)] for gi in g]
+    anc = np.array([[1.0], [0.0]]) if dB == 2 * dA else np.eye(1)
+    Ks = []
+    for sel in range(r):
+        M = np.eye(1)
+        for q in range(nA):
+            M = np.kron(M, K[q][(sel >> q) & 1] if q < k else np.eye(2))
+        Ks.append(np.kron(M, anc))
+    return _kraus_choi(Ks, dA, dB)
+
+
+def contraction_families(dA, dB):
+    """The eight families of Fig. 9 at (dA, dB), as (label, kind, parameter)."""
+    d = dA * dB
+    fam = [("rank 1 (isometry)", "rank", 1), ("rank 2", "rank", 2)]
+    if int(np.log2(d)) != 2:                      # at d_AB = 4 it is the rank-2 family
+        fam.append((r"rank $\log_2 d_{\mathsf{AB}}$", "rank", int(np.log2(d))))
+    fam.append(("full rank (BCSZ)", "rank", d))
+    fam += [("amplitude damping", "amp", 2 ** k) for k in range(1, int(np.log2(dA)) + 1)]
+    fam += [("isometry + 1% depol.", "noisy", 1), ("isometry + 5% depol.", "noisy", 5),
+            (r"flat, rank $\approx\sqrt{d_{\mathsf{AB}}}$", "flat", 2 ** (int(np.log2(d)) // 2))]
+    return fam
+
+
+def sweep_contraction(dims=(4, 8, 16, 32, 64), trials=10, eps=0.5, delta=DELTA,
+                      seed=PAPER_SEED, progress=True):
+    """Fig. 9: how much the fidelity projection loses on tomography estimates.
+
+    For each family and dimension, `trials` random channels rho are drawn, the
+    density estimate rho_hat of FPLS (tau = beta_N/2) is formed from N local
+    Pauli shots, and the Bures distance of its fidelity projection to rho is
+    compared with its own: Theorem 1 bounds the ratio by 2. N is the sample
+    size of Eq. (GutaQST) at accuracy eps and confidence delta with the true
+    Choi rank r (r = 1 for the noisy isometries, the rank of their dominant
+    part): N = (32/3) r^2 3^n log(d_AB/delta) / eps^2, with n = log2 d_AB.
+    The draws are the paper's, so dims 4 to 1024 with trials=10 reproduce
+    data/contraction.json.
+    """
+    rows = []
+    for spec in dims:
+        dA, dB, d = _split_dims(spec)
+        n = int(np.log2(d))
+        for label, kind, r in contraction_families(dA, dB):
+            for t in range(trials):
+                key = (dA, dB, r, t, int(kind == "amp"))
+                rng = paper_rng(seed, 31, *key)
+                if kind == "rank":
+                    rho = random_channel_choi(dA, dB, r, rng)
+                elif kind == "amp":
+                    rho = _amp_damping_rect(dA, dB, r, rng)
+                elif kind == "noisy":            # r is the depolarizing percentage
+                    p = r / 100
+                    rho = (1 - p) * _kraus_choi([_haar_isometry(dA, dB, rng)], dA, dB) + p * np.eye(d) / d
+                else:                            # an equal mixture of r isometries
+                    rho = _kraus_choi([_haar_isometry(dA, dB, rng) / np.sqrt(r) for _ in range(r)], dA, dB)
+                r_true = choi_rank(rho)
+                r_N = 1 if kind == "noisy" else r_true
+                N = int(np.ceil(32 / 3 * r_N ** 2 * 3 ** n * np.log(d / delta) / eps ** 2))
+                rho_ls = simulate_ls_estimate(rho, N, paper_rng(seed, 32, *key))
+                est = threshold_density_estimate(rho_ls, tau=0.5 * bernstein_radius(d, N, delta))
+                proj = fidelity_projection(est, dA)
+                f0, f1 = fidelity(rho, est), fidelity(rho, proj)
+                rows.append({"family": label, "kind": kind, "d_AB": d, "rank": r_true, "trial": t, "N": N,
+                             "inf_est": 1 - f0, "inf_proj": 1 - f1, "kappa": (1 - f1) / (1 - f0),
+                             "bures_ratio": float(np.sqrt(max(0.0, 2 - 2 * f1)) / np.sqrt(max(1e-300, 2 - 2 * f0))),
+                             "rank_est": choi_rank(est)})
+        if progress:
+            _progress(f"d_A x d_B = {dA} x {dB}")
+    if progress:
+        _progress()
+    return {"eps": eps, "delta": delta, "threshold": "beta_N/2", "rows": rows}
